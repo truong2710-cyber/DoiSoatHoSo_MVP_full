@@ -1,0 +1,29 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Generated logs and OCR/document data
+*.log
+*.pdf
+*.txt
+!requirements.txt
+!**/requirements.txt
+deepdoc_vietocr/ocr_outputs/
+
+# Model weights and exported models
+*.pth
+*.onnx
+*.ort
+*.model
+*.res
+
+# Images
+*.png
+*.jpg
+*.webp
+
+# Local/editor files
+.DS_Store
+.vscode/
