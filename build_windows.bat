@@ -9,29 +9,16 @@ if errorlevel 1 (
   exit /b 1
 )
 
-set "TESS_SOURCE=C:\Program Files\Tesseract-OCR"
-if not exist "%TESS_SOURCE%\tesseract.exe" (
-  echo LOI: Chua tim thay Tesseract tai %TESS_SOURCE%.
-  echo Hay cai Tesseract OCR 5 kem ngon ngu Vietnamese truoc khi build.
+if not exist "deepdoc_vietocr\onnx\det.onnx" (
+  echo LOI: Thieu model deepdoc_vietocr\onnx\det.onnx.
   pause
   exit /b 1
 )
-if not exist "%TESS_SOURCE%\tessdata\vie.traineddata" (
-  echo LOI: Tesseract chua co ngon ngu Vietnamese - vie.traineddata.
+if not exist "deepdoc_vietocr\vietocr\weight\vgg_seq2seq.pth" (
+  echo LOI: Thieu model deepdoc_vietocr\vietocr\weight\vgg_seq2seq.pth.
   pause
   exit /b 1
 )
-
-if exist bundled_tesseract rmdir /s /q bundled_tesseract
-mkdir bundled_tesseract\tessdata
-copy /y "%TESS_SOURCE%\tesseract.exe" bundled_tesseract\ >nul
-copy /y "%TESS_SOURCE%\*.dll" bundled_tesseract\ >nul
-copy /y "%TESS_SOURCE%\tessdata\eng.traineddata" bundled_tesseract\tessdata\ >nul
-copy /y "%TESS_SOURCE%\tessdata\vie.traineddata" bundled_tesseract\tessdata\ >nul
-copy /y "%TESS_SOURCE%\tessdata\osd.traineddata" bundled_tesseract\tessdata\ >nul
-if exist "%TESS_SOURCE%\tessdata\pdf.ttf" copy /y "%TESS_SOURCE%\tessdata\pdf.ttf" bundled_tesseract\tessdata\ >nul
-if exist "%TESS_SOURCE%\tessdata\configs" xcopy /e /i /y "%TESS_SOURCE%\tessdata\configs" bundled_tesseract\tessdata\configs >nul
-if exist "%TESS_SOURCE%\tessdata\tessconfigs" xcopy /e /i /y "%TESS_SOURCE%\tessdata\tessconfigs" bundled_tesseract\tessdata\tessconfigs >nul
 
 py -3.12 -m venv .venv
 if errorlevel 1 goto :error
@@ -40,11 +27,11 @@ python -m pip install --upgrade pip
 if errorlevel 1 goto :error
 python -m pip install --only-binary=:all: -r requirements.txt
 if errorlevel 1 goto :error
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name "DoiSoatHoSo" --collect-all pymupdf --add-data "bundled_tesseract;tesseract" app.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name "DoiSoatHoSo" --paths "deepdoc_vietocr" --collect-all pymupdf --collect-all torch --collect-all onnxruntime --collect-all cv2 --collect-all vietocr --add-data "deepdoc_vietocr\conf\service_conf.yaml;conf" --add-data "deepdoc_vietocr\onnx\det.onnx;onnx" --add-data "deepdoc_vietocr\vietocr\weight\vgg_seq2seq.pth;vietocr\weight" app.py
 if errorlevel 1 goto :error
 echo.
 echo Da tao ban portable: dist\DoiSoatHoSo.exe
-echo May nhan KHONG can cai Python hoac Tesseract.
+echo May nhan KHONG can cai Python hoac bo OCR rieng.
 pause
 exit /b 0
 

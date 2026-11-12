@@ -7,24 +7,29 @@ ngày sinh rồi xuất Excel có trạng thái, chi tiết sai lệch và hyper
 
 1. Cài **Python 3.12 64-bit**, nhớ chọn **Add Python to PATH**.
 2. Double-click `chay_source_windows.bat` để chạy ngay.
-3. Trên máy build, cài Tesseract OCR 5 vào `C:\Program Files\Tesseract-OCR`
-   và bảo đảm có `tessdata\vie.traineddata`.
+3. Đảm bảo có hai model DeepDoc tại:
+   `deepdoc_vietocr\onnx\det.onnx` và
+   `deepdoc_vietocr\vietocr\weight\vgg_seq2seq.pth`.
 4. Double-click `build_windows.bat`; bản portable nằm tại `dist\DoiSoatHoSo.exe`.
-5. Chỉ cần gửi file `.exe` này. Máy nhận không cần cài Python hay Tesseract.
+5. Chỉ cần gửi file `.exe` này. Máy nhận không cần cài Python hay bộ OCR riêng.
+
+Các file model bị loại khỏi Git theo `.gitignore`; cần đặt chúng ở đúng các đường dẫn trên
+trước khi chạy OCR hoặc build bản portable.
 
 Nếu trước đó đã chạy bằng phiên bản Python khác và thư mục `.venv` đã tồn tại,
 hãy xóa riêng thư mục `.venv` trong thư mục app rồi chạy lại file `.bat`.
 
 ## OCR cho PDF scan
 
-- Khi chạy source, cài Tesseract OCR 5 vào `C:\Program Files\Tesseract-OCR`.
-- Khi chạy file `.exe` tạo bởi `build_windows.bat`, Tesseract đã được nhúng sẵn.
-- Để đọc tiếng Việt tốt hơn, trong `tessdata` cần có `vie.traineddata`.
-- Khi chạy source mà không có Tesseract, app vẫn đọc được PDF có lớp text và đánh dấu PDF scan là
-  **Cần kiểm tra**.
+- App dùng DeepDoc để phát hiện dòng chữ và VietOCR để nhận dạng tiếng Việt trên CPU.
+- PDF có lớp text vẫn được đọc trực tiếp; PDF scan được chuyển thành ảnh và xử lý bằng DeepDoc.
+- Cột **Độ tin cậy OCR** hiển thị trung bình xác suất ký tự VietOCR theo thang 0–100.
+  Đây là điểm model, không phải xác suất đã hiệu chuẩn rằng toàn bộ hồ sơ chính xác.
+- Hồ sơ scan có điểm OCR dưới 50 sẽ được đánh dấu **Cần kiểm tra**.
+- Nếu thiếu model hoặc thư viện OCR, lỗi được ghi vào kết quả đối soát để hồ sơ scan cần kiểm tra.
 
 Bản `.exe` portable sẽ lớn hơn và lần mở đầu có thể chậm vài giây vì Windows cần
-giải nén engine OCR vào thư mục tạm. Windows SmartScreen cũng có thể cảnh báo vì
+giải nén engine OCR và model vào thư mục tạm. Windows SmartScreen cũng có thể cảnh báo vì
 file chưa được ký số; chỉ chọn **More info - Run anyway** khi nhận file từ nguồn tin cậy.
 
 ## Định dạng Excel đầu vào

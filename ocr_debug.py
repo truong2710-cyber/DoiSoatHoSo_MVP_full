@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from app import find_tesseract, inspect_pdf
+from app import inspect_pdf
 
 
 def main() -> None:
@@ -16,10 +16,11 @@ def main() -> None:
     if args.pdf.suffix.lower() != ".pdf":
         parser.error("File đầu vào phải có đuôi .pdf")
 
-    info = inspect_pdf(args.pdf, find_tesseract())
+    info = inspect_pdf(args.pdf)
     print(f"File: {args.pdf}")
     print(f"Đã dùng OCR: {'Có' if info.used_ocr else 'Không'}")
-    print(f"Độ tin cậy OCR: {info.confidence:.1f}")
+    confidence = f"{info.confidence:.1f}" if info.confidence is not None else "Không có"
+    print(f"Độ tin cậy OCR: {confidence}")
     print(f"Họ tên gợi ý từ tên file: {info.name_hint or '(không có)'}")
     print(f"CCCD/CMND: {', '.join(sorted(info.ids)) or '(không tìm thấy)'}")
     print(f"Các ngày nhận diện: {', '.join(sorted(info.dates)) or '(không tìm thấy)'}")

@@ -155,8 +155,10 @@ class TextRecognizer:
             # Ensure PIL Image
             if isinstance(img, np.ndarray):
                 img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-            text = self.detector.predict(img)
-            results.append((text, 1.0))
+            text, confidence = self.detector.predict(img, return_prob=True)
+            if confidence is None:
+                raise RuntimeError("VietOCR did not return a confidence score")
+            results.append((text, float(confidence)))
         return results, 0.0
 
 
