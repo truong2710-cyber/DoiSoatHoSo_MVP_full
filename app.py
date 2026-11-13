@@ -58,10 +58,16 @@ def ids_match(left: str, right: str) -> bool:
         len(left) == 11 and len(right) == 12 and right.startswith("0") and right[1:] == left
     ) or (
         len(right) == 11 and len(left) == 12 and left.startswith("0") and left[1:] == right
+    ) or (
+        len(left) == 8 and len(right) == 9 and right.startswith("0") and right[1:] == left
+    ) or (
+        len(right) == 8 and len(left) == 9 and left.startswith("0") and left[1:] == right
     )
 
 
 def is_valid_vietnamese_id(value: str, today: date | None = None) -> bool:
+    if len(value) == 9 and value.isdigit():
+        return True
     if len(value) != 12 or not value.isdigit():
         return False
 
@@ -110,8 +116,13 @@ def norm_date(value) -> str:
 
 
 def alternate_norm_date(value) -> str:
-    if value is None or pd.isna(value) or isinstance(value, (datetime, date, pd.Timestamp)):
+    if value is None or pd.isna(value):
         return ""
+    if isinstance(value, (datetime, date, pd.Timestamp)):
+        try:
+            return date(value.year, value.day, value.month).strftime("%d/%m/%Y")
+        except ValueError:
+            return ""
     match = re.search(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})(?!\d)", str(value).strip())
     if not match:
         return ""
@@ -242,6 +253,9 @@ class DocumentInfo:
     birth_date_confidence: float | None = None
     birth_date_out_of_range: bool = False
     birth_date_ambiguous: bool = False
+    birth_date_wide_search: bool = False
+    id_from_pdf: bool = False
+    filename_ids: set[str] = field(default_factory=set)
 
 
 def inspect_pdf(path: Path) -> DocumentInfo:
@@ -275,19 +289,14 @@ def inspect_pdf(path: Path) -> DocumentInfo:
         error = str(exc)
     raw = "\n".join(chunks)
     filename_candidates = extract_id_candidates(path.stem, [])
-    filename_ids = {candidate for candidate, _ in filename_candidates}
-    ocr_lines = [(text, score) for text, score in text_lines if score is not None]
-    ocr_candidates = extract_id_candidates("", ocr_lines)
+    pdf_candidates = extract_id_candidates("", text_lines)
+    pdf_candidates = [candidate for candidate in pdf_candidates if len(candidate[0]) == 12]
     selected_id, id_confidence = select_id_candidate(
-        ocr_candidates, preferred_ids=filename_ids, min_confidence=60.0
+        pdf_candidates, min_confidence=60.0
     )
+    id_from_pdf = selected_id is not None
     if selected_id is None:
         selected_id, id_confidence = select_id_candidate(filename_candidates)
-    if selected_id is None:
-        text_candidates = extract_id_candidates(
-            "", [(text, score) for text, score in text_lines if score is None]
-        )
-        selected_id, id_confidence = select_id_candidate(text_candidates)
     ids = {selected_id} if selected_id else set()
     dates = set()
     for d, m, y in re.findall(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})(?!\d)", raw):
@@ -299,6 +308,7 @@ def inspect_pdf(path: Path) -> DocumentInfo:
         birth_date_confidence,
         birth_date_out_of_range,
         birth_date_ambiguous,
+        birth_date_wide_search,
     ) = extract_birth_date_from_pages(text_pages)
     birth_dates = {birth_date} if birth_date else set()
     name_hint = re.sub(r"\b\d[\d ._-]*\b", " ", path.stem)
@@ -324,6 +334,9 @@ def inspect_pdf(path: Path) -> DocumentInfo:
         birth_date_confidence=birth_date_confidence,
         birth_date_out_of_range=birth_date_out_of_range,
         birth_date_ambiguous=birth_date_ambiguous,
+        birth_date_wide_search=birth_date_wide_search,
+        id_from_pdf=id_from_pdf,
+        filename_ids={candidate for candidate, _ in filename_candidates},
     )
 
 
@@ -376,7 +389,6 @@ def extract_id_candidates(
 
 def select_id_candidate(
     candidates: list[tuple[str, float | None]],
-    preferred_ids: set[str] | None = None,
     min_confidence: float = 60.0,
 ) -> tuple[str | None, float | None]:
     if not candidates:
@@ -386,17 +398,12 @@ def select_id_candidate(
         for index, (candidate, score) in enumerate(candidates)
         if score is None or score >= min_confidence
     ]
-    preferred = [
-        item for item in eligible
-        if preferred_ids and item[1] in preferred_ids
-    ]
-    if preferred:
-        eligible = preferred
     if not eligible:
         return None, None
     candidate, score = max(
         eligible,
         key=lambda item: (
+            len(item[1]) == 12,
             item[2] is not None,
             item[2] if item[2] is not None else 0.0,
             -item[0],
@@ -410,7 +417,8 @@ def extract_birth_date_candidate(
     max_line_distance: int = 12,
     min_confidence: float = 50.0,
     today: date | None = None,
-) -> tuple[str | None, float | None, bool, bool]:
+    near_line_distance: int = 2,
+) -> tuple[str | None, float | None, bool, bool, bool]:
     date_pattern = re.compile(
         r"(?<!\d)(\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{2,4})(?!\d)"
     )
@@ -466,37 +474,45 @@ def extract_birth_date_candidate(
         eligible.append((value, score, distance, start_line, end_line))
 
     if not eligible:
-        return None, None, out_of_range, False
-    best_rank = max(
+        return None, None, out_of_range, False, False
+    nearby = [
+        candidate for candidate in eligible
+        if candidate[2] <= near_line_distance
+    ]
+    used_wide_search = not nearby
+    considered = nearby or eligible
+    nearest_distance = min(candidate[2] for candidate in considered)
+    nearest = [
+        candidate for candidate in considered
+        if candidate[2] == nearest_distance
+    ]
+    best_score = max(
         (
             candidate[1] is not None,
             candidate[1] if candidate[1] is not None else 0.0,
-            -candidate[2],
         )
-        for candidate in eligible
+        for candidate in nearest
     )
     best_dates = {
         candidate[0]
-        for candidate in eligible
+        for candidate in nearest
         if (
             candidate[1] is not None,
             candidate[1] if candidate[1] is not None else 0.0,
-            -candidate[2],
-        ) == best_rank
+        ) == best_score
     }
     if len(best_dates) > 1:
-        return None, None, out_of_range, True
+        return None, None, out_of_range, True, used_wide_search
     _, (value, score, _, _, _) = max(
-        enumerate(eligible),
+        enumerate(nearest),
         key=lambda item: (
             item[1][1] is not None,
             item[1][1] if item[1][1] is not None else 0.0,
-            -item[1][2],
             -item[1][3],
             -item[0],
         ),
     )
-    return value, score, out_of_range, False
+    return value, score, out_of_range, False, used_wide_search
 
 
 def extract_birth_date_from_pages(
@@ -504,7 +520,7 @@ def extract_birth_date_from_pages(
     max_line_distance: int = 12,
     min_confidence: float = 50.0,
     today: date | None = None,
-) -> tuple[str | None, float | None, bool, bool]:
+) -> tuple[str | None, float | None, bool, bool, bool]:
     candidates = [
         extract_birth_date_candidate(
             lines, max_line_distance, min_confidence, today
@@ -518,18 +534,21 @@ def extract_birth_date_from_pages(
             None,
             any(candidate[2] for candidate in candidates),
             any(candidate[3] for candidate in candidates),
+            False,
         )
 
+    nearby = [candidate for candidate in eligible if not candidate[4]]
+    considered = nearby or eligible
     best_score = max(
         (
             candidate[1] is not None,
             candidate[1] if candidate[1] is not None else 0.0,
         )
-        for candidate in eligible
+        for candidate in considered
     )
     best = [
         candidate
-        for candidate in eligible
+        for candidate in considered
         if (
             candidate[1] is not None,
             candidate[1] if candidate[1] is not None else 0.0,
@@ -537,9 +556,9 @@ def extract_birth_date_from_pages(
     ]
     best_dates = {candidate[0] for candidate in best}
     if len(best_dates) > 1:
-        return None, None, False, True
-    value, score, out_of_range, ambiguous = best[0]
-    return value, score, out_of_range, ambiguous
+        return None, None, False, True, not nearby
+    value, score, out_of_range, ambiguous, wide_search = best[0]
+    return value, score, out_of_range, ambiguous, wide_search
 
 
 def extract_birth_dates(
@@ -548,7 +567,7 @@ def extract_birth_dates(
     min_confidence: float = 50.0,
     today: date | None = None,
 ) -> set[str]:
-    value, _, _, _ = extract_birth_date_candidate(
+    value, _, _, _, _ = extract_birth_date_candidate(
         lines, max_line_distance, min_confidence, today
     )
     return {value} if value else set()
@@ -571,14 +590,27 @@ def detect_columns(columns) -> dict[str, str | None]:
     return result
 
 
-def match_document(name: str, citizen_id: str, docs: list[DocumentInfo]) -> tuple[DocumentInfo | None, float]:
+def match_document(
+    name: str,
+    citizen_id: str,
+    docs: list[DocumentInfo],
+    allow_name_fallback: bool = True,
+) -> tuple[DocumentInfo | None, float]:
     if citizen_id:
-        exact = [
+        exact_pdf_ids = [
             d for d in docs
-            if any(ids_match(citizen_id, candidate) for candidate in d.ids)
+            if d.id_from_pdf and any(ids_match(citizen_id, candidate) for candidate in d.ids)
         ]
-        if exact:
-            return exact[0], 1.0
+        if exact_pdf_ids:
+            return exact_pdf_ids[0], 1.0
+        exact_filename_ids = [
+            d for d in docs
+            if any(ids_match(citizen_id, candidate) for candidate in d.filename_ids)
+        ]
+        if exact_filename_ids:
+            return exact_filename_ids[0], 1.0
+    if not allow_name_fallback:
+        return None, 0.0
     n = norm_text(name)
     if not n:
         return None, 0.0
@@ -586,10 +618,79 @@ def match_document(name: str, citizen_id: str, docs: list[DocumentInfo]) -> tupl
     # chỉ vì tên gần giống: đây là lỗi nguy hiểm nhất khi danh sách dài.
     candidates = [
         d for d in docs
-        if not citizen_id or not d.ids or any(ids_match(citizen_id, candidate) for candidate in d.ids)
+        if d.id_from_pdf
+        and (not citizen_id or not d.ids or any(ids_match(citizen_id, candidate) for candidate in d.ids))
     ]
     ranked = sorted(((SequenceMatcher(None, n, d.name_hint).ratio(), d) for d in candidates), reverse=True, key=lambda x: x[0])
     return (ranked[0][1], ranked[0][0]) if ranked and ranked[0][0] >= 0.67 else (None, ranked[0][0] if ranked else 0.0)
+
+
+def filename_similarity(
+    name: str, citizen_id: str, doc: DocumentInfo
+) -> tuple[float, float, float] | None:
+    normalized_name = norm_text(name)
+    normalized_id = norm_digits(citizen_id)
+    if not normalized_name or not normalized_id or not doc.name_hint or not doc.filename_ids:
+        return None
+
+    name_score = SequenceMatcher(None, normalized_name, doc.name_hint).ratio()
+    id_score = max(
+        1.0 if ids_match(normalized_id, filename_id)
+        else SequenceMatcher(None, normalized_id, filename_id).ratio()
+        for filename_id in doc.filename_ids
+    )
+    if name_score < 0.85 or id_score < 0.85:
+        return None
+    return (name_score + id_score) / 2, name_score, id_score
+
+
+def assign_filename_similarity_matches(
+    df: pd.DataFrame,
+    name_column: str,
+    id_column: str,
+    docs: list[DocumentInfo],
+) -> dict[int, tuple[DocumentInfo, float, float, float]]:
+    exact_rows: set[int] = set()
+    exact_docs: set[Path] = set()
+    row_values = []
+    for row_index, (_, row) in enumerate(df.iterrows()):
+        name = str(row.get(name_column, "") or "")
+        citizen_id = norm_digits(row.get(id_column, ""))
+        row_values.append((name, citizen_id))
+        if not citizen_id:
+            continue
+        for doc in docs:
+            if (
+                doc.id_from_pdf
+                and any(ids_match(citizen_id, candidate) for candidate in doc.ids)
+            ) or any(ids_match(citizen_id, candidate) for candidate in doc.filename_ids):
+                exact_rows.add(row_index)
+                exact_docs.add(doc.path)
+
+    candidates = []
+    for row_index, (name, citizen_id) in enumerate(row_values):
+        if row_index in exact_rows:
+            continue
+        for doc in docs:
+            if doc.path in exact_docs:
+                continue
+            scores = filename_similarity(name, citizen_id, doc)
+            if scores:
+                combined, name_score, id_score = scores
+                candidates.append(
+                    (combined, name_score, id_score, row_index, doc)
+                )
+
+    assignments = {}
+    assigned_docs: set[Path] = set()
+    for combined, name_score, id_score, row_index, doc in sorted(
+        candidates, key=lambda item: (-item[0], -item[1], -item[2], item[3], str(item[4].path))
+    ):
+        if row_index in assignments or doc.path in assigned_docs:
+            continue
+        assignments[row_index] = (doc, combined, name_score, id_score)
+        assigned_docs.add(doc.path)
+    return assignments
 
 
 def process(
@@ -617,7 +718,13 @@ def process(
         if on_scan:
             on_scan(i, len(pdfs), path, "done", info)
 
-    results, used = [], set()
+    filename_matches = assign_filename_similarity_matches(
+        df, cols["name"], cols["id"], docs
+    )
+    filename_match_owners = {
+        match[0].path: row_index for row_index, match in filename_matches.items()
+    }
+    results, used, confidently_used = [], set(), set()
     for i, (_, row) in enumerate(df.iterrows(), 1):
         progress("match", i, len(df), f"Đang đối chiếu dòng {i}")
         name = str(row.get(cols["name"], "") or "")
@@ -625,7 +732,28 @@ def process(
         raw_dob = row.get(cols["dob"], "") if cols["dob"] else ""
         dob = norm_date(raw_dob)
         alternate_dob = alternate_norm_date(raw_dob)
-        doc, score = match_document(name, cid, docs)
+        row_index = i - 1
+        available_docs = [
+            d for d in docs
+            if d.path not in confidently_used
+            and (
+                d.path not in filename_match_owners
+                or filename_match_owners[d.path] == row_index
+            )
+        ]
+        doc, score = match_document(
+            name, cid, available_docs, allow_name_fallback=False
+        )
+        filename_similarity_match = False
+        filename_name_score = filename_id_score = 0.0
+        if not doc and row_index in filename_matches:
+            doc, score, filename_name_score, filename_id_score = filename_matches[row_index]
+            if doc.path in confidently_used:
+                doc = None
+            else:
+                filename_similarity_match = True
+        if not doc:
+            doc, score = match_document(name, cid, available_docs)
         if not doc:
             result = ["Không tìm thấy hồ sơ", "Không tìm thấy PDF khớp CCCD hoặc họ tên", "", "", ""]
             results.append(result)
@@ -633,31 +761,65 @@ def process(
                 on_result(i, name, cid, result)
             continue
         used.add(doc.path)
+        if score >= 0.8:
+            confidently_used.add(doc.path)
         mismatches = []
         format_warnings = []
+        filename_id_fallback = bool(
+            cid
+            and any(ids_match(cid, candidate) for candidate in doc.filename_ids)
+            and not (
+                doc.id_from_pdf
+                and any(ids_match(cid, candidate) for candidate in doc.ids)
+            )
+        )
+        if filename_id_fallback:
+            warning = "Ghép theo ID trong tên file; cần kiểm tra thủ công"
+            if doc.id_from_pdf and doc.ids:
+                warning = (
+                    f"{warning} vì ID đọc từ PDF ({', '.join(sorted(doc.ids))}) "
+                    "không khớp ID Excel"
+                )
+            format_warnings.append(warning)
+        if filename_similarity_match:
+            mismatches.append(
+                "Ghép theo tên và ID gần đúng trong tên file "
+                f"(độ khớp tên {filename_name_score:.0%}, "
+                f"ID {filename_id_score:.0%}; ngưỡng mỗi trường 85%)"
+            )
         if doc.birth_date_ambiguous:
             format_warnings.append(
                 "Có nhiều ngày sinh phù hợp cùng mức tin cậy gần nhãn; cần kiểm tra thủ công"
+            )
+        if doc.birth_date_wide_search and doc.birth_dates:
+            format_warnings.append(
+                "Ngày sinh chỉ tìm thấy bằng cách tìm rộng trong cùng trang; cần kiểm tra thủ công"
             )
         if doc.birth_date_out_of_range and not doc.birth_dates:
             format_warnings.append(
                 "Ngày sinh gần nhãn trong PDF ngoài độ tuổi hợp lý 18–100; cần kiểm tra thủ công"
             )
-        if cid and doc.ids and not any(ids_match(cid, candidate) for candidate in doc.ids):
+        if (
+            cid
+            and doc.id_from_pdf
+            and doc.ids
+            and not any(ids_match(cid, candidate) for candidate in doc.ids)
+            and not filename_id_fallback
+        ):
             mismatches.append(f"CCCD Excel {cid} không khớp PDF ({', '.join(sorted(doc.ids))})")
         if raw_dob is not None and not pd.isna(raw_dob) and str(raw_dob).strip() and not dob:
             if alternate_dob and alternate_dob in doc.birth_dates:
                 format_warnings.append(
-                    f"Ngày sinh Excel có thể đang theo định dạng tháng/ngày; "
-                    f"đọc theo tháng/ngày là {alternate_dob}, khớp với PDF"
+                    f"Ngày sinh Excel có thể bị đảo ngày/tháng; "
+                    f"đổi thứ tự thành {alternate_dob} thì khớp với PDF"
                 )
             else:
                 format_warnings.append("Không nhận diện được định dạng ngày sinh trong Excel; cần kiểm tra lại ngày/tháng")
         elif dob and doc.birth_dates and dob not in doc.birth_dates:
             if alternate_dob and alternate_dob in doc.birth_dates:
                 format_warnings.append(
-                    f"Ngày sinh Excel có thể đang theo định dạng tháng/ngày; "
-                    f"đọc theo ngày/tháng là {dob}, còn PDF khớp {alternate_dob}"
+                    f"Ngày sinh Excel có thể bị đảo ngày/tháng; "
+                    f"đổi thứ tự thành {alternate_dob} thì khớp với PDF"
                 )
             else:
                 mismatches.append(f"Ngày sinh Excel {dob} không khớp PDF ({', '.join(sorted(doc.birth_dates))})")
@@ -680,7 +842,16 @@ def process(
         if doc.error:
             status, detail = "Cần kiểm tra", "; ".join([doc.error, *format_warnings, ocr_warning])
         elif mismatches:
-            status, detail = "Sai thông tin", "; ".join([*mismatches, *format_warnings, ocr_warning])
+            if filename_similarity_match:
+                status = "Sai thông tin"
+            elif doc.confidence is not None and doc.confidence >= 80:
+                status = "Sai thông tin"
+            else:
+                status = "Cần kiểm tra"
+                format_warnings.append(
+                    "Độ tin cậy PDF dưới 80 hoặc không có điểm; sai lệch chưa thể xác nhận"
+                )
+            detail = "; ".join([*mismatches, *format_warnings, ocr_warning])
         else:
             review_reasons = list(format_warnings)
             if dob and not doc.birth_dates:

@@ -48,26 +48,40 @@ luôn xuất kết quả dạng `.xlsx`.
 
 ## Nguyên tắc ghép hồ sơ
 
-1. Ưu tiên CCCD tìm thấy trong tên file hoặc nội dung PDF.
-2. Nếu chưa tìm được, so khớp họ tên không dấu trong tên file.
-3. Kiểm tra CCCD và ngày sinh nếu PDF đọc được các trường đó.
-4. File PDF không ghép với dòng nào được liệt kê tại sheet `PDF chưa ghép`.
+1. Ưu tiên ID 12 chữ số đọc được từ nội dung PDF.
+2. Chỉ khi nội dung PDF không có ID 12 chữ số hợp lệ, app mới dùng ID trong tên file
+   làm phương án dự phòng; ID dự phòng có thể dài 9 hoặc 12 chữ số.
+3. Nếu ID đọc từ PDF không khớp dòng Excel, app có thể thử ID từ tên file; kết quả ghép
+   bằng ID tên file luôn là **Cần kiểm tra**. Không ghép theo tên file nếu không có ID
+   khớp.
+4. Một PDF đã được ghép với độ tin cậy cao (điểm từ 0.8 trở lên, bao gồm ghép ID chính
+   xác) không được ghép với dòng Excel khác.
+5. File PDF không ghép với dòng nào được liệt kê tại sheet `PDF chưa ghép`.
 
-Khi có nhiều số ID trong PDF, app chỉ giữ số có điểm OCR dòng cao nhất trong các ứng viên
-đúng cấu trúc CCCD 12 số: ba chữ số đầu phải từ `001` đến `096` (bao gồm cả hai đầu).
-ID 9 chữ số và mã tỉnh/thành `000` hoặc từ `097` trở lên bị loại. Nếu số bị tách qua hai
-dòng, điểm dùng là trung bình hai dòng. Bảng quét trực tiếp hiển thị điểm của ID đã chọn.
-ID được OCR xác nhận với tên file sẽ được ưu tiên; nếu không có ứng viên khớp tên file,
-chỉ các ID OCR có điểm từ 60 trở lên mới được xét để tránh nhận nhầm chuỗi số nhiễu.
-PDF có lớp text và tên file không có điểm OCR.
+Nếu không có dòng Excel khớp chính xác ID trong tên file, app có thể ghép gần đúng khi
+cả độ tương đồng tên và ID trong tên file đều đạt ít nhất 85%. App chọn cặp có điểm trung
+bình cao nhất, chỉ ghép mỗi PDF với một dòng, và đánh dấu kết quả **Sai thông tin**;
+quy tắc này dựa trên tên file, không phụ thuộc điểm OCR của PDF.
 
-Ngày sinh phải nằm trong cùng trang, cách nhãn ngày sinh tối đa 12 dòng, và trong khoảng
-18–100 tuổi tính đến ngày chạy app. Nếu có nhiều ngày phù hợp, app chọn ngày có điểm OCR
-dòng cao nhất; ngày bị tách qua hai dòng dùng điểm trung bình. Khoảng tuổi này là bộ lọc
-hợp lý do người dùng chọn cho hồ sơ bằng lái, không phải kết luận về điều kiện pháp lý
-cho mọi hạng giấy phép. Điểm ngày sinh đã chọn cũng hiển thị trong bảng quét. PDF có lớp
-text không có điểm OCR nên dùng ngày gần nhãn nhất. Nếu nhiều ngày cùng điểm và cùng độ
-gần nhãn, app không tự chọn và yêu cầu kiểm tra thủ công.
+Ngày sinh khớp sau khi đảo ngày/tháng sẽ được đánh dấu **Cần kiểm tra**, không phải
+**Sai thông tin**. Sai lệch chỉ được đánh dấu **Sai thông tin** khi độ tin cậy PDF từ 80
+trở lên; nếu điểm thấp hơn 80 hoặc không có điểm, kết quả là **Cần kiểm tra**.
+
+Khi có nhiều số ID 12 chữ số trong PDF, app chọn số có điểm OCR dòng cao nhất; ba chữ
+số đầu phải từ `001` đến `096` (bao gồm cả hai đầu). Chỉ các ID OCR có điểm từ 60 trở
+lên mới được xét để tránh nhận nhầm chuỗi số nhiễu. Nếu số bị tách qua hai dòng, điểm
+dùng là trung bình hai dòng. ID 9 chữ số không bị loại khi được dùng làm dự phòng từ tên
+file. Bảng quét trực tiếp hiển thị điểm của ID đã chọn. PDF có lớp text và tên file không
+có điểm OCR.
+
+Ngày sinh được tìm trong cùng trang, ưu tiên ngày cách nhãn không quá hai dòng. Chỉ khi
+không có ngày hợp lệ gần nhãn, app mở rộng tìm kiếm tối đa 12 dòng và đánh dấu kết quả
+đó cần kiểm tra thủ công. Trong từng nhóm, chọn khoảng cách gần nhất trước, rồi mới dùng
+điểm OCR để phân định. Ngày phải trong khoảng 18–100 tuổi tính đến ngày chạy app. Ngày
+bị tách qua hai dòng dùng điểm trung bình. Khoảng tuổi này là bộ lọc hợp lý do người dùng
+chọn cho hồ sơ bằng lái, không phải kết luận về điều kiện pháp lý cho mọi hạng giấy phép.
+Điểm ngày sinh đã chọn cũng hiển thị trong bảng quét. PDF có lớp text không có điểm OCR;
+nếu nhiều ngày cùng khoảng cách và điểm, app không tự chọn và yêu cầu kiểm tra thủ công.
 
 Nên đặt tên PDF theo mẫu `Ho Ten - CCCD - ngay.thang.nam.pdf`; cách này giúp app
 ghép đúng ngay cả khi bản scan mờ.
