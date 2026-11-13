@@ -17,6 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 import fitz
 import numpy as np
 import pandas as pd
+import pdfplumber
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -58,6 +59,26 @@ def ids_match(left: str, right: str) -> bool:
     ) or (
         len(right) == 11 and len(left) == 12 and left.startswith("0") and left[1:] == right
     )
+
+
+def is_valid_vietnamese_id(value: str, today: date | None = None) -> bool:
+    if len(value) != 12 or not value.isdigit():
+        return False
+
+    if not "001" <= value[:3] <= "096":
+        return False
+
+    century_code = int(value[3])
+    century = 1900 if century_code < 2 else 2000 if century_code < 4 else 2100 + ((century_code - 4) // 2) * 100
+    birth_year = century + int(value[4:6])
+    return birth_year <= (today or date.today()).year
+
+
+def is_plausible_driving_dob(value: str, today: date | None = None) -> bool:
+    parsed = datetime.strptime(value, "%d/%m/%Y").date()
+    current = today or date.today()
+    age = current.year - parsed.year - ((current.month, current.day) < (parsed.month, parsed.day))
+    return 18 <= age <= 100
 
 
 def norm_date(value) -> str:
@@ -184,9 +205,8 @@ def confirm_output_path(path: Path) -> Path | None:
         initial_name = renamed_path.name
 
 
-def ocr_page(page: fitz.Page) -> tuple[str, float, list[tuple[str, float]]]:
-    pix = page.get_pixmap(matrix=fitz.Matrix(2.2, 2.2), colorspace=fitz.csRGB, alpha=False)
-    image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+def ocr_page(page: pdfplumber.page.Page) -> tuple[str, float, list[tuple[str, float]]]:
+    image = np.array(page.to_image(resolution=216).annotated)
     print("Đang OCR trang PDF bằng DeepDoc + VietOCR...")
     results = get_deepdoc_ocr()(image)
     recognized = [
@@ -218,38 +238,69 @@ class DocumentInfo:
     used_ocr: bool
     error: str = ""
     text_lines: list[tuple[str, float | None]] = field(default_factory=list)
+    id_confidence: float | None = None
+    birth_date_confidence: float | None = None
+    birth_date_out_of_range: bool = False
+    birth_date_ambiguous: bool = False
 
 
 def inspect_pdf(path: Path) -> DocumentInfo:
-    chunks, ocr_scores, text_lines, used_ocr, error = [], [], [], False, ""
+    chunks, ocr_scores, text_lines, text_pages, used_ocr, error = [], [], [], [], False, ""
     try:
         with fitz.open(path) as doc:
-            for page in list(doc)[:8]:
-                text = page.get_text("text").strip()
-                if len(re.sub(r"\s", "", text)) >= 40:
-                    chunks.append(text)
-                    text_lines.extend((line.strip(), None) for line in text.splitlines() if line.strip())
-                else:
-                    used_ocr = True
-                    ocr_text, conf, page_lines = ocr_page(page)
-                    chunks.append(ocr_text)
+            render_doc = None
+            try:
+                for page_index, page in enumerate(list(doc)[:8]):
+                    text = page.get_text("text").strip()
+                    if len(re.sub(r"\s", "", text)) >= 40:
+                        chunks.append(text)
+                        page_lines = [
+                            (line.strip(), None)
+                            for line in text.splitlines()
+                            if line.strip()
+                        ]
+                    else:
+                        used_ocr = True
+                        if render_doc is None:
+                            render_doc = pdfplumber.open(path)
+                        ocr_text, conf, page_lines = ocr_page(render_doc.pages[page_index])
+                        chunks.append(ocr_text)
+                        ocr_scores.append((conf, max(len(re.sub(r"\s", "", ocr_text)), 1)))
                     text_lines.extend(page_lines)
-                    ocr_scores.append((conf, max(len(re.sub(r"\s", "", ocr_text)), 1)))
+                    text_pages.append(page_lines)
+            finally:
+                if render_doc is not None:
+                    render_doc.close()
     except Exception as exc:
         error = str(exc)
     raw = "\n".join(chunks)
-    combined = path.stem + "\n" + raw
-    ids = set()
-    for candidate in re.findall(r"(?<!\d)(?:\d[ .-]?){9,12}(?!\d)", combined):
-        digits = norm_digits(candidate)
-        if len(digits) in (9, 12):
-            ids.add(digits)
+    filename_candidates = extract_id_candidates(path.stem, [])
+    filename_ids = {candidate for candidate, _ in filename_candidates}
+    ocr_lines = [(text, score) for text, score in text_lines if score is not None]
+    ocr_candidates = extract_id_candidates("", ocr_lines)
+    selected_id, id_confidence = select_id_candidate(
+        ocr_candidates, preferred_ids=filename_ids, min_confidence=60.0
+    )
+    if selected_id is None:
+        selected_id, id_confidence = select_id_candidate(filename_candidates)
+    if selected_id is None:
+        text_candidates = extract_id_candidates(
+            "", [(text, score) for text, score in text_lines if score is None]
+        )
+        selected_id, id_confidence = select_id_candidate(text_candidates)
+    ids = {selected_id} if selected_id else set()
     dates = set()
     for d, m, y in re.findall(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})(?!\d)", raw):
         value = norm_date(f"{d}/{m}/{y}")
         if value:
             dates.add(value)
-    birth_dates = extract_birth_dates(text_lines)
+    (
+        birth_date,
+        birth_date_confidence,
+        birth_date_out_of_range,
+        birth_date_ambiguous,
+    ) = extract_birth_date_from_pages(text_pages)
+    birth_dates = {birth_date} if birth_date else set()
     name_hint = re.sub(r"\b\d[\d ._-]*\b", " ", path.stem)
     name_hint = norm_text(name_hint)
     confidence = (
@@ -259,50 +310,248 @@ def inspect_pdf(path: Path) -> DocumentInfo:
         else None if used_ocr else 100.0
     )
     return DocumentInfo(
-        path, raw, ids, dates, birth_dates, name_hint, confidence, used_ocr, error, text_lines
+        path=path,
+        text=raw,
+        ids=ids,
+        dates=dates,
+        birth_dates=birth_dates,
+        name_hint=name_hint,
+        confidence=confidence,
+        used_ocr=used_ocr,
+        error=error,
+        text_lines=text_lines,
+        id_confidence=id_confidence,
+        birth_date_confidence=birth_date_confidence,
+        birth_date_out_of_range=birth_date_out_of_range,
+        birth_date_ambiguous=birth_date_ambiguous,
     )
+
+
+def extract_id_candidates(
+    filename: str,
+    lines: list[tuple[str, float | None]],
+) -> list[tuple[str, float | None]]:
+    candidates: list[tuple[str, float | None]] = []
+    seen: dict[str, int] = {}
+
+    def add(candidate: str, score: float | None) -> None:
+        digits = norm_digits(candidate)
+        if not is_valid_vietnamese_id(digits):
+            return
+        if digits not in seen:
+            seen[digits] = len(candidates)
+            candidates.append((digits, score))
+        elif score is not None:
+            index = seen[digits]
+            old_score = candidates[index][1]
+            if old_score is None or score > old_score:
+                candidates[index] = (digits, score)
+
+    pattern = re.compile(r"(?<!\d)(?:\d[ .-]?){8,11}\d(?!\d)")
+    for match in pattern.finditer(filename):
+        add(match.group(), None)
+    for text, score in lines:
+        for match in pattern.finditer(text):
+            add(match.group(), score)
+
+    for index in range(len(lines) - 1):
+        first, first_score = lines[index]
+        second, second_score = lines[index + 1]
+        tail = re.search(r"(\d[\d .-]*)$", first.strip())
+        head = re.match(r"(\d[\d .-]*)", second.strip())
+        if not tail or not head:
+            continue
+        first_digits = norm_digits(tail.group(1))
+        second_digits = norm_digits(head.group(1))
+        if len(first_digits) + len(second_digits) not in (9, 12):
+            continue
+        score = (
+            (first_score + second_score) / 2
+            if first_score is not None and second_score is not None
+            else None
+        )
+        add(first_digits + second_digits, score)
+    return candidates
+
+
+def select_id_candidate(
+    candidates: list[tuple[str, float | None]],
+    preferred_ids: set[str] | None = None,
+    min_confidence: float = 60.0,
+) -> tuple[str | None, float | None]:
+    if not candidates:
+        return None, None
+    eligible = [
+        (index, candidate, score)
+        for index, (candidate, score) in enumerate(candidates)
+        if score is None or score >= min_confidence
+    ]
+    preferred = [
+        item for item in eligible
+        if preferred_ids and item[1] in preferred_ids
+    ]
+    if preferred:
+        eligible = preferred
+    if not eligible:
+        return None, None
+    candidate, score = max(
+        eligible,
+        key=lambda item: (
+            item[2] is not None,
+            item[2] if item[2] is not None else 0.0,
+            -item[0],
+        ),
+    )[1:3]
+    return candidate, score
+
+
+def extract_birth_date_candidate(
+    lines: list[tuple[str, float | None]],
+    max_line_distance: int = 12,
+    min_confidence: float = 50.0,
+    today: date | None = None,
+) -> tuple[str | None, float | None, bool, bool]:
+    date_pattern = re.compile(
+        r"(?<!\d)(\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{2,4})(?!\d)"
+    )
+    label_pattern = re.compile(
+        r"\b(?:ngay(?: thang nam)? sinh|nam sinh|date of birth|date of binh|dob)\b"
+    )
+    labels = [
+        index
+        for index, (text, confidence) in enumerate(lines)
+        if (confidence is None or confidence >= min_confidence)
+        and label_pattern.search(norm_text(text))
+    ]
+    date_candidates: list[tuple[str, float | None, int, int]] = []
+
+    def add_dates(text: str, start_line: int, end_line: int, score: float | None) -> None:
+        if score is not None and score < min_confidence:
+            return
+        for match in date_pattern.finditer(text):
+            value = norm_date(re.sub(r"\s+", "", match.group(1)))
+            if value:
+                date_candidates.append((value, score, start_line, end_line))
+
+    for index, (text, confidence) in enumerate(lines):
+        add_dates(text, index, index, confidence)
+        if index + 1 < len(lines):
+            next_text, next_confidence = lines[index + 1]
+            joined = text + " " + next_text
+            split_at = len(text)
+            for match in date_pattern.finditer(joined):
+                if match.start() < split_at < match.end():
+                    score = (
+                        (confidence + next_confidence) / 2
+                        if confidence is not None and next_confidence is not None
+                        else None
+                    )
+                    add_dates(match.group(), index, index + 1, score)
+
+    eligible: list[tuple[str, float | None, int, int, int]] = []
+    out_of_range = False
+    for value, score, start_line, end_line in date_candidates:
+        distances = [
+            0 if start_line <= label <= end_line
+            else start_line - label if label < start_line
+            else label - end_line
+            for label in labels
+        ]
+        distance = min(distances, default=max_line_distance + 1)
+        if distance > max_line_distance:
+            continue
+        if not is_plausible_driving_dob(value, today):
+            out_of_range = True
+            continue
+        eligible.append((value, score, distance, start_line, end_line))
+
+    if not eligible:
+        return None, None, out_of_range, False
+    best_rank = max(
+        (
+            candidate[1] is not None,
+            candidate[1] if candidate[1] is not None else 0.0,
+            -candidate[2],
+        )
+        for candidate in eligible
+    )
+    best_dates = {
+        candidate[0]
+        for candidate in eligible
+        if (
+            candidate[1] is not None,
+            candidate[1] if candidate[1] is not None else 0.0,
+            -candidate[2],
+        ) == best_rank
+    }
+    if len(best_dates) > 1:
+        return None, None, out_of_range, True
+    _, (value, score, _, _, _) = max(
+        enumerate(eligible),
+        key=lambda item: (
+            item[1][1] is not None,
+            item[1][1] if item[1][1] is not None else 0.0,
+            -item[1][2],
+            -item[1][3],
+            -item[0],
+        ),
+    )
+    return value, score, out_of_range, False
+
+
+def extract_birth_date_from_pages(
+    pages: list[list[tuple[str, float | None]]],
+    max_line_distance: int = 12,
+    min_confidence: float = 50.0,
+    today: date | None = None,
+) -> tuple[str | None, float | None, bool, bool]:
+    candidates = [
+        extract_birth_date_candidate(
+            lines, max_line_distance, min_confidence, today
+        )
+        for lines in pages
+    ]
+    eligible = [candidate for candidate in candidates if candidate[0] is not None]
+    if not eligible:
+        return (
+            None,
+            None,
+            any(candidate[2] for candidate in candidates),
+            any(candidate[3] for candidate in candidates),
+        )
+
+    best_score = max(
+        (
+            candidate[1] is not None,
+            candidate[1] if candidate[1] is not None else 0.0,
+        )
+        for candidate in eligible
+    )
+    best = [
+        candidate
+        for candidate in eligible
+        if (
+            candidate[1] is not None,
+            candidate[1] if candidate[1] is not None else 0.0,
+        ) == best_score
+    ]
+    best_dates = {candidate[0] for candidate in best}
+    if len(best_dates) > 1:
+        return None, None, False, True
+    value, score, out_of_range, ambiguous = best[0]
+    return value, score, out_of_range, ambiguous
 
 
 def extract_birth_dates(
     lines: list[tuple[str, float | None]],
-    max_line_distance: int = 2,
+    max_line_distance: int = 12,
     min_confidence: float = 50.0,
+    today: date | None = None,
 ) -> set[str]:
-    date_pattern = re.compile(r"(?<!\d)(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})(?!\d)")
-    label_pattern = re.compile(
-        r"\b(?:ngay(?: thang nam)? sinh|nam sinh|date of birth|date of binh|dob)\b"
+    value, _, _, _ = extract_birth_date_candidate(
+        lines, max_line_distance, min_confidence, today
     )
-    labels = []
-    date_candidates = []
-    for index, (text, confidence) in enumerate(lines):
-        if confidence is not None and confidence < min_confidence:
-            continue
-        normalized = norm_text(text)
-        if label_pattern.search(normalized):
-            labels.append(index)
-        for match in date_pattern.finditer(text):
-            value = norm_date(match.group(1))
-            if value:
-                date_candidates.append((index, value))
-
-    birth_dates = set()
-    for label_index in labels:
-        nearby = [
-            (abs(date_index - label_index), date_index, value)
-            for date_index, value in date_candidates
-            if abs(date_index - label_index) <= max_line_distance
-        ]
-        if not nearby:
-            continue
-        nearest_distance = min(distance for distance, _, _ in nearby)
-        nearest_dates = {
-            value
-            for distance, _, value in nearby
-            if distance == nearest_distance
-        }
-        if len(nearest_dates) == 1:
-            birth_dates.update(nearest_dates)
-    return birth_dates
+    return {value} if value else set()
 
 
 ALIASES = {
@@ -327,7 +576,6 @@ def match_document(name: str, citizen_id: str, docs: list[DocumentInfo]) -> tupl
         exact = [
             d for d in docs
             if any(ids_match(citizen_id, candidate) for candidate in d.ids)
-            or ids_match(citizen_id, norm_digits(d.path.stem))
         ]
         if exact:
             return exact[0], 1.0
@@ -387,6 +635,14 @@ def process(
         used.add(doc.path)
         mismatches = []
         format_warnings = []
+        if doc.birth_date_ambiguous:
+            format_warnings.append(
+                "Có nhiều ngày sinh phù hợp cùng mức tin cậy gần nhãn; cần kiểm tra thủ công"
+            )
+        if doc.birth_date_out_of_range and not doc.birth_dates:
+            format_warnings.append(
+                "Ngày sinh gần nhãn trong PDF ngoài độ tuổi hợp lý 18–100; cần kiểm tra thủ công"
+            )
         if cid and doc.ids and not any(ids_match(cid, candidate) for candidate in doc.ids):
             mismatches.append(f"CCCD Excel {cid} không khớp PDF ({', '.join(sorted(doc.ids))})")
         if raw_dob is not None and not pd.isna(raw_dob) and str(raw_dob).strip() and not dob:
@@ -611,13 +867,15 @@ class App(tk.Tk):
 
         scan_tree = create_tree(
             scan_tab,
-            ("scan", "pdf", "status", "ids", "dob", "confidence", "text"),
+            ("scan", "pdf", "status", "ids", "id_score", "dob", "dob_score", "confidence", "text"),
             {
                 "scan": ("Lượt", 55),
                 "pdf": ("PDF", 240),
                 "status": ("Trạng thái quét", 120),
                 "ids": ("CCCD/CMND", 140),
+                "id_score": ("Điểm ID (%)", 85),
                 "dob": ("Ngày sinh", 110),
+                "dob_score": ("Điểm ngày sinh (%)", 115),
                 "confidence": ("OCR (%)", 75),
                 "text": ("Văn bản OCR / text trích xuất", 400),
             },
@@ -682,7 +940,7 @@ class App(tk.Tk):
                     if self.scan_preview_tree is not None and self.scan_preview_tree.winfo_exists():
                         item_id = f"scan-{index}"
                         if phase == "start":
-                            values = (index, path.name, "Đang quét...", "", "", "", "")
+                            values = (index, path.name, "Đang quét...", "", "", "", "", "", "")
                         else:
                             status = "Lỗi đọc" if info.error else (
                                 "Đã OCR" if info.used_ocr else "Đã đọc text"
@@ -697,7 +955,11 @@ class App(tk.Tk):
                                 path.name,
                                 status,
                                 ", ".join(sorted(info.ids)),
+                                f"{info.id_confidence:.1f}" if info.id_confidence is not None else "",
                                 ", ".join(sorted(info.birth_dates)),
+                                f"{info.birth_date_confidence:.1f}"
+                                if info.birth_date_confidence is not None
+                                else "",
                                 confidence,
                                 info.text,
                             )

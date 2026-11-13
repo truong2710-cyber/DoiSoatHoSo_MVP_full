@@ -1,22 +1,30 @@
 import io
 import tempfile
 from contextlib import redirect_stdout
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
 import fitz
+import pdfplumber
 from fitz import Document
 
 from app import (
     DocumentInfo,
     confirm_output_path,
+    extract_birth_date_candidate,
+    extract_birth_date_from_pages,
     extract_birth_dates,
+    is_plausible_driving_dob,
+    is_valid_vietnamese_id,
     inspect_pdf,
     norm_date,
     norm_text,
     ocr_page,
     process,
+    select_id_candidate,
 )
 
 
@@ -39,14 +47,22 @@ def test_ocr_page_reads_deepdoc_result_text_and_score():
             def __call__(self, image):
                 assert image.ndim == 3
                 assert image.shape[2] == 3
+                assert image.shape[0] == round(page.rect.height * 3)
+                assert image.shape[1] == round(page.rect.width * 3)
                 return [
                     ([], ("CCCD 034202005650", 0.8)),
                     ([], ("23/10/2002", 0.6)),
                     ([], (" ", 1.0)),
                 ]
 
-        with fitz.open(pdf_path) as pdf, patch("app.get_deepdoc_ocr", return_value=FakeOCR()):
-            text, confidence, lines = ocr_page(pdf[0])
+        with pdfplumber.open(pdf_path) as pdf, patch("app.get_deepdoc_ocr", return_value=FakeOCR()):
+            rendered = np.array(pdf.pages[0].to_image(resolution=216).annotated)
+            assert tuple(rendered.shape) == (
+                round(page.rect.height * 3),
+                round(page.rect.width * 3),
+                3,
+            )
+            text, confidence, lines = ocr_page(pdf.pages[0])
 
         assert text == "CCCD 034202005650 23/10/2002"
         assert abs(confidence - 72.5925925926) < 0.001
@@ -90,14 +106,188 @@ def test_extract_birth_date_ignores_low_confidence_label_or_date():
 
 
 def test_extract_birth_date_ignores_date_outside_nearby_lines():
-    lines = [
-        ("24/10/1999", 92.0),
-        ("Địa chỉ:", 91.0),
-        ("Hà Nội", 93.0),
-        ("Ngày, tháng, năm sinh:", 96.0),
-    ]
+    lines = [("24/10/1999", 92.0), *[("Địa chỉ:", 91.0)] * 12,
+             ("Ngày, tháng, năm sinh:", 96.0)]
 
     assert extract_birth_dates(lines) == set()
+
+
+def test_birth_date_searches_beyond_adjacent_ocr_lines():
+    lines = [
+        ("Date of birth:", 87.5),
+        *[("unrelated field", 85.0)] * 11,
+        ("15/08/1966", 90.0),
+        ("Nguyen Van A", 86.0),
+        ("Ngày sinh", 89.3),
+        ("Applicant name", 87.0),
+        ("Place of birth", 86.0),
+        ("Hải Dương, ngày 19 tháng 11 năm 2022", 86.3),
+        ("Certificate date", 87.0),
+        ("15/08/1966", 87.7),
+    ]
+
+    assert extract_birth_dates(lines, today=date(2026, 11, 13)) == {"15/08/1966"}
+
+
+def test_birth_date_search_does_not_cross_pdf_pages():
+    pages = [
+        [("Date of birth:", 90.0)],
+        [("unrelated", 90.0), ("15/08/1966", 95.0)],
+    ]
+
+    assert extract_birth_date_from_pages(
+        pages, today=date(2026, 11, 13)
+    ) == (None, None, False, False)
+
+
+def test_vietnamese_id_format_filter_and_score_selection():
+    assert is_valid_vietnamese_id("034202005650")
+    assert is_valid_vietnamese_id("001202005650")
+    assert is_valid_vietnamese_id("096202005650")
+    assert not is_valid_vietnamese_id("000202005650")
+    assert not is_valid_vietnamese_id("097202005650")
+    assert not is_valid_vietnamese_id("123456789")
+    assert not is_valid_vietnamese_id("034250005650")
+    assert not is_valid_vietnamese_id("1234567890")
+
+    with tempfile.TemporaryDirectory() as td:
+        pdf_path = Path(td) / "scan.pdf"
+        document = Document()
+        document.new_page()
+        document.save(pdf_path)
+        lines = [
+            ("CCCD 034202005650", 68.0),
+            ("CCCD 034202005651", 92.0),
+            ("CCCD 999202005650", 99.0),
+        ]
+        with patch(
+            "app.ocr_page",
+            return_value=(" ".join(text for text, _ in lines), 85.0, lines),
+        ):
+            info = inspect_pdf(pdf_path)
+
+        assert info.ids == {"034202005651"}
+        assert info.id_confidence == 92.0
+
+
+def test_id_selection_prefers_ocr_candidate_corroborated_by_filename():
+    assert select_id_candidate(
+        [("001204017170", 83.2), ("001204047970", 74.7)],
+        preferred_ids={"001204047970"},
+    ) == ("001204047970", 74.7)
+
+
+def test_id_selection_rejects_low_confidence_ocr_noise():
+    assert select_id_candidate([("077077000000", 52.6)]) == (None, None)
+
+
+def test_split_vietnamese_id_uses_mean_line_confidence():
+    with tempfile.TemporaryDirectory() as td:
+        pdf_path = Path(td) / "scan.pdf"
+        document = Document()
+        document.new_page()
+        document.save(pdf_path)
+        lines = [("CCCD: 034202", 80.0), ("005650", 60.0)]
+        with patch(
+            "app.ocr_page",
+            return_value=("CCCD: 034202 005650", 70.0, lines),
+        ):
+            info = inspect_pdf(pdf_path)
+
+        assert info.ids == {"034202005650"}
+        assert info.id_confidence == 70.0
+
+
+def test_driving_dob_plausibility_bounds():
+    today = date(2026, 6, 18)
+    assert is_plausible_driving_dob("18/06/2008", today)
+    assert not is_plausible_driving_dob("19/06/2008", today)
+    assert is_plausible_driving_dob("18/06/1926", today)
+    assert not is_plausible_driving_dob("17/06/1925", today)
+    assert not is_plausible_driving_dob("19/06/2026", today)
+
+
+def test_birth_date_selects_highest_confidence_plausible_candidate():
+    lines = [
+        ("Ngày, tháng, năm sinh:", 96.0),
+        ("23/10/2002", 75.0),
+        ("Ngày sinh:", 90.0),
+        ("11/02/1990", 92.0),
+        ("Ngày sinh:", 99.0),
+        ("19/06/2008", 99.0),
+    ]
+
+    assert extract_birth_dates(lines, today=date(2026, 6, 18)) == {"11/02/1990"}
+
+
+def test_split_birth_date_uses_mean_line_confidence():
+    value, confidence, out_of_range, ambiguous = extract_birth_date_candidate(
+        [
+            ("Ngày, tháng, năm sinh:", 96.0),
+            ("24/10/", 80.0),
+            ("1999", 90.0),
+        ],
+        today=date(2026, 6, 18),
+    )
+
+    assert value == "24/10/1999"
+    assert confidence == 85.0
+    assert not out_of_range
+    assert not ambiguous
+
+
+def test_inspect_pdf_keeps_selected_birth_date_and_score():
+    with tempfile.TemporaryDirectory() as td:
+        pdf_path = Path(td) / "scan.pdf"
+        document = Document()
+        document.new_page()
+        document.save(pdf_path)
+        lines = [
+            ("Ngày, tháng, năm sinh:", 96.0),
+            ("23/10/2002", 75.0),
+            ("Ngày sinh:", 90.0),
+            ("11/02/1990", 92.0),
+        ]
+        with patch(
+            "app.ocr_page",
+            return_value=(" ".join(text for text, _ in lines), 85.0, lines),
+        ):
+            info = inspect_pdf(pdf_path)
+
+        assert info.birth_dates == {"11/02/1990"}
+        assert info.birth_date_confidence == 92.0
+        assert not info.birth_date_out_of_range
+        assert not info.birth_date_ambiguous
+
+
+def test_birth_date_reports_nearby_out_of_range_candidate():
+    value, confidence, out_of_range, ambiguous = extract_birth_date_candidate(
+        [
+            ("Ngày, tháng, năm sinh:", 96.0),
+            ("19/06/2008", 99.0),
+        ],
+        today=date(2026, 6, 18),
+    )
+
+    assert value is None
+    assert confidence is None
+    assert out_of_range
+    assert not ambiguous
+
+
+def test_tied_plausible_birth_dates_remain_ambiguous():
+    value, confidence, out_of_range, ambiguous = extract_birth_date_candidate(
+        [
+            ("Ngày, tháng, năm sinh:", 96.0),
+            ("23/10/2002 24/10/2002", 90.0),
+        ],
+        today=date(2026, 6, 18),
+    )
+
+    assert value is None
+    assert confidence is None
+    assert not out_of_range
+    assert ambiguous
 
 
 def test_inspect_pdf_aggregates_ocr_confidence():
@@ -117,6 +307,25 @@ def test_inspect_pdf_aggregates_ocr_confidence():
         assert info.confidence == 86.7
         assert info.text == "recognized text"
         assert info.text_lines == [("recognized text", 86.7)]
+
+
+def test_inspect_pdf_uses_ocr_id_score_from_pdfplumber_render():
+    with tempfile.TemporaryDirectory() as td:
+        pdf_path = Path(td) / "scan.pdf"
+        document = Document()
+        document.new_page()
+        document.save(pdf_path)
+
+        class FakeOCR:
+            def __call__(self, image):
+                return [([], ("CCCD 033181011361", 0.9))]
+
+        with patch("app.get_deepdoc_ocr", return_value=FakeOCR()):
+            info = inspect_pdf(pdf_path)
+
+        assert info.ids == {"033181011361"}
+        assert info.id_confidence == 90.0
+        assert info.used_ocr
 
 
 def test_existing_output_can_be_overwritten_or_renamed():
@@ -317,7 +526,16 @@ if __name__ == "__main__":
     test_extract_birth_date_when_ocr_label_has_extra_noise()
     test_extract_birth_date_ignores_low_confidence_label_or_date()
     test_extract_birth_date_ignores_date_outside_nearby_lines()
+    test_vietnamese_id_format_filter_and_score_selection()
+    test_split_vietnamese_id_uses_mean_line_confidence()
+    test_driving_dob_plausibility_bounds()
+    test_birth_date_selects_highest_confidence_plausible_candidate()
+    test_split_birth_date_uses_mean_line_confidence()
+    test_inspect_pdf_keeps_selected_birth_date_and_score()
+    test_birth_date_reports_nearby_out_of_range_candidate()
+    test_tied_plausible_birth_dates_remain_ambiguous()
     test_inspect_pdf_aggregates_ocr_confidence()
+    test_inspect_pdf_uses_ocr_id_score_from_pdfplumber_render()
     test_existing_output_can_be_overwritten_or_renamed()
     test_end_to_end_text_pdf()
     test_swapped_dob_format_is_warning_not_mismatch()
