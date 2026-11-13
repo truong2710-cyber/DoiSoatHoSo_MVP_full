@@ -17,6 +17,7 @@ from app import (
     extract_birth_date_candidate,
     extract_birth_date_from_pages,
     extract_birth_dates,
+    extract_ocr_birth_dates,
     alternate_norm_date,
     ids_match,
     is_plausible_driving_dob,
@@ -28,6 +29,7 @@ from app import (
     ocr_page,
     process,
     select_id_candidate,
+    vietnamese_id_birth_year,
 )
 
 
@@ -56,8 +58,8 @@ def test_ocr_page_reads_deepdoc_result_text_and_score():
                 assert image.shape[0] == round(page.rect.height * 3)
                 assert image.shape[1] == round(page.rect.width * 3)
                 return [
-                    ([], ("CCCD 034202005650", 0.8)),
-                    ([], ("23/10/2002", 0.6)),
+                    ([(0, 0), (10, 0), (10, 5), (0, 5)], ("CCCD 034202005650", 0.8)),
+                    ([(20, 10), (30, 10), (30, 15), (20, 15)], ("23/10/2002", 0.6)),
                     ([], (" ", 1.0)),
                 ]
 
@@ -68,13 +70,133 @@ def test_ocr_page_reads_deepdoc_result_text_and_score():
                 round(page.rect.width * 3),
                 3,
             )
-            text, confidence, lines = ocr_page(pdf.pages[0])
+            text, confidence, lines, layout = ocr_page(pdf.pages[0])
 
         assert text == "CCCD 034202005650 23/10/2002"
         assert abs(confidence - 72.5925925926) < 0.001
         assert lines == [
             ("CCCD 034202005650", 80.0),
             ("23/10/2002", 60.0),
+        ]
+        assert layout[0][:2] == ("CCCD 034202005650", 80.0)
+        assert layout[0][2] == (
+            0.0, 0.0, 10 / rendered.shape[1], 5 / rendered.shape[0]
+        )
+
+
+def test_ocr_page_rotates_image_and_maps_boxes_back_to_page_coordinates():
+    with tempfile.TemporaryDirectory() as td:
+        pdf_path = Path(td) / "scan.pdf"
+        document = Document()
+        page = document.new_page()
+        document.save(pdf_path)
+
+        class FakeOCR:
+            def __call__(self, image):
+                assert image.shape[0] == round(page.rect.width * 3)
+                assert image.shape[1] == round(page.rect.height * 3)
+                return [
+                    ([(0, 0), (10, 0), (10, 5), (0, 5)], ("DOB", 0.9)),
+                ]
+
+        with pdfplumber.open(pdf_path) as pdf, patch(
+            "app.get_deepdoc_ocr", return_value=FakeOCR()
+        ):
+            _, _, _, layout = ocr_page(pdf.pages[0], rotation_degrees=90)
+
+        assert layout[0][2] == (
+            0.0,
+            1 - 10 / round(pdf.pages[0].height * 3),
+            5 / round(pdf.pages[0].width * 3),
+            1.0,
+        )
+
+
+def test_ocr_birth_date_parser_prefers_slashes_and_uses_id_year_when_malformed():
+    assert extract_ocr_birth_dates("DOB 29/02/1.888") == ["29/02/1888"]
+    assert extract_ocr_birth_dates(
+        "DOB 29/02/1.888", inferred_birth_year=1988
+    ) == ["29/02/1988"]
+    assert extract_ocr_birth_dates(
+        "DOB 29/02/1.888; other date 01.03.1988",
+        inferred_birth_year=1988,
+    ) == ["29/02/1988"]
+    assert extract_ocr_birth_dates(
+        "DOB 13/1111991", inferred_birth_year=1991
+    ) == ["13/11/1991"]
+
+
+def test_vietnamese_id_birth_year_inference_requires_valid_12_digit_id():
+    assert vietnamese_id_birth_year("033088001705") == 1988
+    assert vietnamese_id_birth_year("001202005650") == 2002
+    assert vietnamese_id_birth_year("145892756") is None
+
+
+def test_inspect_pdf_infers_uncertain_dob_year_only_from_high_confidence_pdf_id():
+    for id_confidence, expected_dates in ((85.0, {"29/02/1988"}), (79.9, set())):
+        with tempfile.TemporaryDirectory() as td:
+            pdf_path = Path(td) / "scan.pdf"
+            document = Document()
+            document.new_page()
+            document.save(pdf_path)
+            lines = [
+                ("CCCD 033088001705", id_confidence),
+                ("Ngày sinh: 29/02/1.888", 90.0),
+            ]
+            layout = [
+                ("CCCD 033088001705", id_confidence, (0.1, 0.1, 0.4, 0.15)),
+                ("Ngày sinh: 29/02/1.888", 90.0, (0.1, 0.2, 0.6, 0.25)),
+            ]
+            with patch(
+                "app.ocr_page",
+                return_value=(
+                    " ".join(text for text, _ in lines),
+                    88.0,
+                    lines,
+                    layout,
+                ),
+            ):
+                info = inspect_pdf(pdf_path)
+
+            assert info.birth_dates == expected_dates
+
+
+def test_inspect_pdf_retries_rotations_and_keeps_best_dob_evidence():
+    with tempfile.TemporaryDirectory() as td:
+        pdf_path = Path(td) / "scan.pdf"
+        document = Document()
+        document.new_page()
+        document.save(pdf_path)
+        label = ("Date of birth:", 90.0, (0.1, 0.1, 0.3, 0.15))
+
+        def fake_ocr_page(page, rotation_degrees=0):
+            if rotation_degrees == 0:
+                return (
+                    "Date of birth unreadable",
+                    80.0,
+                    [("Date of birth:", 90.0), ("unreadable", 60.0)],
+                    [label],
+                )
+            if rotation_degrees == 90:
+                return (
+                    "23/06/1983",
+                    90.0,
+                    [("23/06/1983", 90.0)],
+                    [("23/06/1983", 90.0, (0.1, 0.16, 0.3, 0.2))],
+                )
+            return (
+                "20/06/1983",
+                60.0,
+                [("20/06/1983", 60.0)],
+                [("20/06/1983", 60.0, (0.1, 0.16, 0.3, 0.2))],
+            )
+
+        with patch("app.ocr_page", side_effect=fake_ocr_page) as ocr_mock:
+            info = inspect_pdf(pdf_path)
+
+        assert info.birth_dates == {"23/06/1983"}
+        assert [call.kwargs.get("rotation_degrees", 0) for call in ocr_mock.call_args_list] == [
+            0, 90, -90
         ]
 
 
@@ -168,6 +290,119 @@ def test_birth_date_search_does_not_cross_pdf_pages():
     ) == (None, None, False, False, False)
 
 
+def test_spatial_dob_votes_prefer_repeated_labeled_date_over_higher_single_score():
+    pages = [
+        [
+            ("Date of birth", 90.0),
+            ("23/06/1983", 91.1),
+            ("Ngày sinh:", 88.9),
+            ("23/06/1983", 91.8),
+        ],
+        [
+            ("23/06/1983", 72.0),
+            ("Ngày tháng năm sinh:", 89.2),
+        ],
+        [
+            ("Ngày sinh / Date of binh 20/06/1983", 75.9),
+        ],
+    ]
+    layout_pages = [
+        [
+            ("Date of birth", 90.0, (0.05, 0.1, 0.25, 0.15)),
+            ("23/06/1983", 91.1, (0.35, 0.1, 0.55, 0.15)),
+            ("Ngày sinh:", 88.9, (0.05, 0.5, 0.25, 0.55)),
+            ("23/06/1983", 91.8, (0.35, 0.5, 0.55, 0.55)),
+        ],
+        [
+            ("23/06/1983", 72.0, (0.35, 0.4, 0.55, 0.45)),
+            ("Ngày tháng năm sinh:", 89.2, (0.05, 0.4, 0.25, 0.45)),
+        ],
+        [
+            ("Ngày sinh / Date of binh 20/06/1983", 75.9, (0.37, 0.40, 0.66, 0.43)),
+        ],
+    ]
+
+    assert extract_birth_date_from_pages(
+        pages,
+        today=date(2026, 11, 13),
+        layout_pages=layout_pages,
+    ) == ("23/06/1983", (91.1 + 91.8 + 72.0) / 3, False, False, False)
+
+
+def test_spatial_dob_vote_tie_requires_manual_review():
+    pages = [
+        [("Date of birth:", 90.0), ("23/06/1983", 90.0)],
+        [("Date of birth:", 90.0), ("20/06/1983", 90.0)],
+    ]
+    layout_pages = [
+        [
+            ("Date of birth:", 90.0, (0.1, 0.1, 0.3, 0.15)),
+            ("23/06/1983", 90.0, (0.1, 0.16, 0.3, 0.2)),
+        ],
+        [
+            ("Date of birth:", 90.0, (0.1, 0.1, 0.3, 0.15)),
+            ("20/06/1983", 90.0, (0.1, 0.16, 0.3, 0.2)),
+        ],
+    ]
+
+    assert extract_birth_date_from_pages(
+        pages,
+        today=date(2026, 11, 13),
+        layout_pages=layout_pages,
+    ) == (None, None, False, True, False)
+
+
+def test_spatial_dob_distance_uses_smaller_axis_gap_for_same_row():
+    pages = [[("Date of birth:", 90.0), ("23/06/1983", 90.0)]]
+    layout_pages = [[
+        ("Date of birth:", 90.0, (0.1, 0.1, 0.2, 0.15)),
+        ("23/06/1983", 90.0, (0.35, 0.1, 0.45, 0.15)),
+    ]]
+
+    assert extract_birth_date_from_pages(
+        pages,
+        today=date(2026, 11, 13),
+        layout_pages=layout_pages,
+    ) == ("23/06/1983", 90.0, False, False, False)
+
+
+def test_spatial_dob_distance_rejects_candidate_separated_on_both_axes():
+    pages = [[("Date of birth:", 90.0), ("23/06/1983", 90.0)]]
+    layout_pages = [[
+        ("Date of birth:", 90.0, (0.1, 0.1, 0.2, 0.15)),
+        ("23/06/1983", 90.0, (0.35, 0.22, 0.45, 0.27)),
+    ]]
+
+    assert extract_birth_date_from_pages(
+        pages,
+        today=date(2026, 11, 13),
+        layout_pages=layout_pages,
+    ) == (None, None, False, False, False)
+
+
+def test_spatial_dob_vote_margin_threshold_is_point_zero_seven():
+    pages = [
+        [("Date of birth:", 90.0), ("23/06/1983", 90.0)],
+        [("Date of birth:", 90.0), ("20/06/1983", 74.0)],
+    ]
+    layout_pages = [
+        [
+            ("Date of birth:", 90.0, (0.1, 0.1, 0.3, 0.15)),
+            ("23/06/1983", 90.0, (0.1, 0.16, 0.3, 0.2)),
+        ],
+        [
+            ("Date of birth:", 90.0, (0.1, 0.1, 0.3, 0.15)),
+            ("20/06/1983", 74.0, (0.1, 0.16, 0.3, 0.2)),
+        ],
+    ]
+
+    assert extract_birth_date_from_pages(
+        pages,
+        today=date(2026, 11, 13),
+        layout_pages=layout_pages,
+    ) == ("23/06/1983", 90.0, False, False, False)
+
+
 def test_vietnamese_id_format_filter_and_score_selection():
     assert is_valid_vietnamese_id("034202005650")
     assert is_valid_vietnamese_id("001202005650")
@@ -190,7 +425,7 @@ def test_vietnamese_id_format_filter_and_score_selection():
         ]
         with patch(
             "app.ocr_page",
-            return_value=(" ".join(text for text, _ in lines), 85.0, lines),
+            return_value=(" ".join(text for text, _ in lines), 85.0, lines, []),
         ):
             info = inspect_pdf(pdf_path)
 
@@ -223,7 +458,7 @@ def test_split_vietnamese_id_uses_mean_line_confidence():
         lines = [("CCCD: 034202", 80.0), ("005650", 60.0)]
         with patch(
             "app.ocr_page",
-            return_value=("CCCD: 034202 005650", 70.0, lines),
+            return_value=("CCCD: 034202 005650", 70.0, lines, []),
         ):
             info = inspect_pdf(pdf_path)
 
@@ -284,7 +519,7 @@ def test_inspect_pdf_keeps_selected_birth_date_and_score():
         ]
         with patch(
             "app.ocr_page",
-            return_value=(" ".join(text for text, _ in lines), 85.0, lines),
+            return_value=(" ".join(text for text, _ in lines), 85.0, lines, []),
         ):
             info = inspect_pdf(pdf_path)
 
@@ -307,7 +542,7 @@ def test_inspect_pdf_marks_wide_dob_fallback_for_manual_review():
         ]
         with patch(
             "app.ocr_page",
-            return_value=(" ".join(text for text, _ in lines), 85.0, lines),
+            return_value=(" ".join(text for text, _ in lines), 85.0, lines, []),
         ):
             info = inspect_pdf(pdf_path)
 
@@ -356,7 +591,7 @@ def test_inspect_pdf_aggregates_ocr_confidence():
 
         with patch(
             "app.ocr_page",
-            return_value=("recognized text", 86.7, [("recognized text", 86.7)]),
+            return_value=("recognized text", 86.7, [("recognized text", 86.7)], []),
         ):
             info = inspect_pdf(pdf_path)
 
@@ -397,6 +632,7 @@ def test_inspect_pdf_prefers_12_digit_content_id_over_filename_id():
                 "CCCD 034202005650",
                 90.0,
                 [("CCCD 034202005650", 90.0)],
+                [],
             ),
         ):
             info = inspect_pdf(pdf_path)
@@ -426,7 +662,7 @@ def test_inspect_pdf_recovers_valid_id_substring_from_overlong_ocr_digits():
             with patch(
                 "app.ocr_page",
                 return_value=(" ".join(["recognized"] * 8 + [ocr_line]), 75.0,
-                              [("recognized", 75.0)] * 8 + [(ocr_line, 75.0)]),
+                              [("recognized", 75.0)] * 8 + [(ocr_line, 75.0)], []),
             ):
                 info = inspect_pdf(pdf_path)
 
@@ -447,6 +683,7 @@ def test_overlong_ocr_id_recovery_does_not_accept_invalid_window():
                 "recognized text",
                 75.0,
                 [("recognized text", 75.0), ("110427074009701", 75.0)],
+                [],
             ),
         ):
             info = inspect_pdf(pdf_path)
@@ -463,7 +700,7 @@ def test_inspect_pdf_uses_filename_9_digit_id_when_pdf_has_no_12_digit_id():
         document.save(pdf_path)
         with patch(
             "app.ocr_page",
-            return_value=("unreadable", 80.0, [("unreadable", 80.0)]),
+            return_value=("unreadable", 80.0, [("unreadable", 80.0)], []),
         ):
             info = inspect_pdf(pdf_path)
 
@@ -835,10 +1072,24 @@ def test_ocr_confidence_is_written_to_results():
 if __name__ == "__main__":
     test_normalization()
     test_ocr_page_reads_deepdoc_result_text_and_score()
+    test_ocr_page_rotates_image_and_maps_boxes_back_to_page_coordinates()
+    test_ocr_birth_date_parser_prefers_slashes_and_uses_id_year_when_malformed()
+    test_vietnamese_id_birth_year_inference_requires_valid_12_digit_id()
+    test_inspect_pdf_infers_uncertain_dob_year_only_from_high_confidence_pdf_id()
+    test_inspect_pdf_retries_rotations_and_keeps_best_dob_evidence()
     test_extract_birth_date_from_line_before_label()
     test_extract_birth_date_when_ocr_label_has_extra_noise()
     test_extract_birth_date_ignores_low_confidence_label_or_date()
     test_extract_birth_date_ignores_date_outside_nearby_lines()
+    test_nearby_birth_date_beats_higher_confidence_distant_date()
+    test_wide_birth_date_fallback_is_flagged_for_manual_review()
+    test_nearby_birth_date_on_another_page_beats_wide_fallback()
+    test_birth_date_search_does_not_cross_pdf_pages()
+    test_spatial_dob_votes_prefer_repeated_labeled_date_over_higher_single_score()
+    test_spatial_dob_vote_tie_requires_manual_review()
+    test_spatial_dob_distance_uses_smaller_axis_gap_for_same_row()
+    test_spatial_dob_distance_rejects_candidate_separated_on_both_axes()
+    test_spatial_dob_vote_margin_threshold_is_point_zero_seven()
     test_vietnamese_id_format_filter_and_score_selection()
     test_id_selection_prefers_highest_confidence_candidate()
     test_id_selection_prioritizes_12_digits_over_9_digits()

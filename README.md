@@ -75,14 +75,23 @@ các cửa sổ 12 số hợp lệ và ưu tiên ID trùng với tên file. ID 9
 được dùng làm dự phòng từ tên file. Bảng quét trực tiếp hiển thị điểm của ID đã chọn.
 PDF có lớp text và tên file không có điểm OCR.
 
-Ngày sinh được tìm trong cùng trang, ưu tiên ngày cách nhãn không quá hai dòng. Chỉ khi
-không có ngày hợp lệ gần nhãn, app mở rộng tìm kiếm tối đa 12 dòng và đánh dấu kết quả
-đó cần kiểm tra thủ công. Trong từng nhóm, chọn khoảng cách gần nhất trước, rồi mới dùng
-điểm OCR để phân định. Ngày phải trong khoảng 18–100 tuổi tính đến ngày chạy app. Ngày
-bị tách qua hai dòng dùng điểm trung bình. Khoảng tuổi này là bộ lọc hợp lý do người dùng
-chọn cho hồ sơ bằng lái, không phải kết luận về điều kiện pháp lý cho mọi hạng giấy phép.
-Điểm ngày sinh đã chọn cũng hiển thị trong bảng quét. PDF có lớp text không có điểm OCR;
-nếu nhiều ngày cùng khoảng cách và điểm, app không tự chọn và yêu cầu kiểm tra thủ công.
+Ngày sinh được ghép với nhãn gần nhất theo vị trí trên trang; khoảng cách chuẩn hóa là
+giá trị nhỏ hơn giữa khoảng hở ngang và khoảng hở dọc, tối đa `0.04`. Vì vậy ngày cùng
+hàng hoặc cùng cột với nhãn vẫn có thể ghép dù cách xa theo trục còn lại. Mỗi cặp
+nhãn/ngày là một lượt bầu độc lập, kể cả khi có nhiều lượt trên cùng một trang. Mỗi lượt
+có trọng số `0.5 + 0.5 × (điểm OCR / 100)`, vì vậy ngày được
+nhận diện lặp lại có thể thắng một lần đọc có điểm cao hơn. Nếu tổng trọng số của hai
+ngày đứng đầu chênh nhau không quá `0.07`, kết quả được để trống và yêu cầu kiểm tra thủ
+công. Khi OCR năm sinh bị lỗi định dạng hoặc thiếu chữ số, app có thể dùng năm suy ra từ
+CCCD 12 số đọc trực tiếp từ PDF với điểm OCR từ 80 trở lên; tên file không được dùng để
+suy ra năm. Cách đọc ưu tiên ngày có dấu `/` trước dấu `.`. Khi OCR không đọc được ngày
+sinh đáng tin cậy, app thử OCR lại trang khi xoay `+90°` và `-90°`, rồi chọn kết quả có
+bằng chứng ngày sinh/CCCD tốt hơn. Khi thiếu tọa độ OCR, app dùng cách tìm theo dòng: ưu
+tiên ngày cách nhãn không quá hai dòng, sau đó mới mở rộng tối đa 12 dòng và đánh dấu
+kết quả cần kiểm tra thủ công. Ngày phải trong khoảng 18–100 tuổi tính đến ngày chạy app.
+Khoảng tuổi này là bộ lọc hợp lý do người dùng chọn cho hồ sơ bằng lái, không phải kết
+luận về điều kiện pháp lý cho mọi hạng giấy phép. Điểm ngày sinh đã chọn cũng hiển thị
+trong bảng quét; PDF có lớp text không có điểm OCR.
 
 Nên đặt tên PDF theo mẫu `Ho Ten - CCCD - ngay.thang.nam.pdf`; cách này giúp app
 ghép đúng ngay cả khi bản scan mờ.

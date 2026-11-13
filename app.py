@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 import subprocess
@@ -78,6 +79,20 @@ def is_valid_vietnamese_id(value: str, today: date | None = None) -> bool:
     century = 1900 if century_code < 2 else 2000 if century_code < 4 else 2100 + ((century_code - 4) // 2) * 100
     birth_year = century + int(value[4:6])
     return birth_year <= (today or date.today()).year
+
+
+def vietnamese_id_birth_year(value: str) -> int | None:
+    if len(value) != 12 or not value.isdigit():
+        return None
+    century_code = int(value[3])
+    century = (
+        1900
+        if century_code < 2
+        else 2000
+        if century_code < 4
+        else 2100 + ((century_code - 4) // 2) * 100
+    )
+    return century + int(value[4:6])
 
 
 def is_plausible_driving_dob(value: str, today: date | None = None) -> bool:
@@ -216,25 +231,129 @@ def confirm_output_path(path: Path) -> Path | None:
         initial_name = renamed_path.name
 
 
-def ocr_page(page: pdfplumber.page.Page) -> tuple[str, float, list[tuple[str, float]]]:
+def ocr_page(
+    page: pdfplumber.page.Page,
+    rotation_degrees: int = 0,
+) -> tuple[
+    str,
+    float,
+    list[tuple[str, float]],
+    list[tuple[str, float, tuple[float, float, float, float]]],
+]:
     image = np.array(page.to_image(resolution=216).annotated)
+    if rotation_degrees not in (0, 90, -90):
+        raise ValueError("rotation_degrees must be 0, 90, or -90")
+    if rotation_degrees:
+        image = np.rot90(image, k=-rotation_degrees // 90).copy()
     print("Đang OCR trang PDF bằng DeepDoc + VietOCR...")
     results = get_deepdoc_ocr()(image)
-    recognized = [
-        (text.strip(), float(score))
-        for _, (text, score) in (results or [])
-        if text and text.strip()
-    ]
-    text = " ".join(word for word, _ in recognized)
-    character_count = sum(len(word) for word, _ in recognized)
+    recognized = []
+    layout_lines = []
+    for box, (text, score) in (results or []):
+        if not text or not text.strip():
+            continue
+        recognized.append((text.strip(), float(score)))
+        points = np.asarray(box, dtype=float)
+        if points.size < 8:
+            continue
+        points = points.reshape(-1, 2)
+        points[:, 0] /= image.shape[1]
+        points[:, 1] /= image.shape[0]
+        if rotation_degrees == 90:
+            points = np.column_stack((points[:, 1], 1 - points[:, 0]))
+        elif rotation_degrees == -90:
+            points = np.column_stack((1 - points[:, 1], points[:, 0]))
+        bounds = tuple(
+            float(value)
+            for value in (
+                points[:, 0].min(),
+                points[:, 1].min(),
+                points[:, 0].max(),
+                points[:, 1].max(),
+            )
+        )
+        layout_lines.append((text.strip(), float(score) * 100, bounds))
+    recognized_text = recognized
+    text = " ".join(word for word, _ in recognized_text)
+    character_count = sum(len(word) for word, _ in recognized_text)
     confidence = (
-        sum(len(word) * score for word, score in recognized) / character_count
+        sum(len(word) * score for word, score in recognized_text) / character_count
         if character_count
         else 0.0
     )
     return text, confidence * 100, [
-        (word, score * 100) for word, score in recognized
+        (word, score * 100) for word, score in recognized_text
+    ], layout_lines
+
+
+def _birth_date_labels(
+    lines: list[tuple[str, float | None, tuple[float, float, float, float]]],
+    min_confidence: float = 50.0,
+) -> list[tuple[str, float | None, tuple[float, float, float, float]]]:
+    label_pattern = re.compile(
+        r"\b(?:sinh ngay|ngay(?: thang nam)? sinh|nam sinh|date of birth|date of binh|dob)\b"
+    )
+    return [
+        line
+        for line in lines
+        if (line[1] is None or line[1] >= min_confidence)
+        and label_pattern.search(norm_text(line[0]))
     ]
+
+
+def _orientation_quality(
+    lines: list[tuple[str, float | None]],
+    layout: list[
+        tuple[str, float | None, tuple[float, float, float, float]]
+    ],
+    context_labels: list[
+        tuple[str, float | None, tuple[float, float, float, float]]
+    ] | None = None,
+) -> tuple[
+    tuple[int, float, float, int],
+    list[tuple[str, float | None, tuple[float, float, float, float]]],
+]:
+    effective_layout = list(layout)
+    if not _birth_date_labels(effective_layout) and context_labels:
+        effective_layout.extend(context_labels)
+    votes, _ = extract_spatial_birth_date_votes(effective_layout)
+    id_candidates = extract_id_candidates("", lines, recover_overlong=True)
+    _, id_confidence = select_id_candidate(id_candidates)
+    vote_weight = sum(
+        0.5 + 0.5 * (score if score is not None else 50.0) / 100
+        for _, score in votes
+    )
+    quality = (
+        len(votes),
+        vote_weight,
+        id_confidence if id_confidence is not None else 0.0,
+        len(id_candidates),
+    )
+    return quality, effective_layout
+
+
+def _retry_ocr_orientation(
+    lines: list[tuple[str, float | None]],
+    confidence: float,
+    layout: list[
+        tuple[str, float | None, tuple[float, float, float, float]]
+    ],
+) -> bool:
+    labels = _birth_date_labels(layout)
+    votes, _ = extract_spatial_birth_date_votes(layout)
+    high_confidence_vote = any(
+        score is not None and score >= 80.0 for _, score in votes
+    )
+    candidates = extract_id_candidates("", lines, recover_overlong=True)
+    id_candidate, id_confidence = select_id_candidate(candidates)
+    weak_id = id_candidate is not None and (
+        id_confidence is None or id_confidence < 80.0
+    )
+    return (
+        (bool(labels) and not high_confidence_vote)
+        or weak_id
+        or (confidence < 60.0 and not high_confidence_vote)
+    )
 
 
 @dataclass
@@ -249,6 +368,9 @@ class DocumentInfo:
     used_ocr: bool
     error: str = ""
     text_lines: list[tuple[str, float | None]] = field(default_factory=list)
+    layout_pages: list[
+        list[tuple[str, float | None, tuple[float, float, float, float]]] | None
+    ] = field(default_factory=list)
     id_confidence: float | None = None
     birth_date_confidence: float | None = None
     birth_date_out_of_range: bool = False
@@ -259,7 +381,9 @@ class DocumentInfo:
 
 
 def inspect_pdf(path: Path) -> DocumentInfo:
-    chunks, ocr_scores, text_lines, text_pages, used_ocr, error = [], [], [], [], False, ""
+    chunks, ocr_scores, text_lines, text_pages, layout_pages, used_ocr, error = (
+        [], [], [], [], [], False, ""
+    )
     try:
         with fitz.open(path) as doc:
             render_doc = None
@@ -273,15 +397,65 @@ def inspect_pdf(path: Path) -> DocumentInfo:
                             for line in text.splitlines()
                             if line.strip()
                         ]
+                        page_layout = None
                     else:
                         used_ocr = True
                         if render_doc is None:
                             render_doc = pdfplumber.open(path)
-                        ocr_text, conf, page_lines = ocr_page(render_doc.pages[page_index])
+                        ocr_text, conf, page_lines, page_layout = ocr_page(
+                            render_doc.pages[page_index]
+                        )
+                        base_page_lines = list(page_lines)
+                        if page_layout and _retry_ocr_orientation(
+                            page_lines, conf, page_layout
+                        ):
+                            base_labels = _birth_date_labels(page_layout)
+                            best_quality, _ = _orientation_quality(
+                                page_lines, page_layout
+                            )
+                            for rotation in (90, -90):
+                                (
+                                    rotated_text,
+                                    rotated_conf,
+                                    rotated_lines,
+                                    rotated_layout,
+                                ) = ocr_page(
+                                    render_doc.pages[page_index],
+                                    rotation_degrees=rotation,
+                                )
+                                quality, effective_layout = _orientation_quality(
+                                    rotated_lines,
+                                    rotated_layout,
+                                    context_labels=base_labels,
+                                )
+                                if quality <= best_quality:
+                                    continue
+                                best_quality = quality
+                                ocr_text = rotated_text
+                                conf = rotated_conf
+                                page_lines = list(rotated_lines)
+                                if not _birth_date_labels(rotated_layout):
+                                    page_lines.extend(
+                                        (text, score)
+                                        for text, score, _ in base_labels
+                                    )
+                                rotated_ids = extract_id_candidates(
+                                    "", page_lines, recover_overlong=True
+                                )
+                                if not rotated_ids:
+                                    page_lines.extend(
+                                        line
+                                        for line in base_page_lines
+                                        if extract_id_candidates(
+                                            "", [line], recover_overlong=True
+                                        )
+                                    )
+                                page_layout = effective_layout
                         chunks.append(ocr_text)
                         ocr_scores.append((conf, max(len(re.sub(r"\s", "", ocr_text)), 1)))
                     text_lines.extend(page_lines)
                     text_pages.append(page_lines)
+                    layout_pages.append(page_layout or None)
             finally:
                 if render_doc is not None:
                     render_doc.close()
@@ -311,6 +485,11 @@ def inspect_pdf(path: Path) -> DocumentInfo:
     id_from_pdf = selected_id is not None
     if selected_id is None:
         selected_id, id_confidence = select_id_candidate(filename_candidates)
+    inferred_birth_year = (
+        vietnamese_id_birth_year(selected_id)
+        if id_from_pdf and id_confidence is not None and id_confidence >= 80.0
+        else None
+    )
     ids = {selected_id} if selected_id else set()
     dates = set()
     for d, m, y in re.findall(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})(?!\d)", raw):
@@ -323,7 +502,11 @@ def inspect_pdf(path: Path) -> DocumentInfo:
         birth_date_out_of_range,
         birth_date_ambiguous,
         birth_date_wide_search,
-    ) = extract_birth_date_from_pages(text_pages)
+    ) = extract_birth_date_from_pages(
+        text_pages,
+        layout_pages=layout_pages,
+        inferred_birth_year=inferred_birth_year,
+    )
     birth_dates = {birth_date} if birth_date else set()
     name_hint = re.sub(r"\b\d[\d ._-]*\b", " ", path.stem)
     name_hint = norm_text(name_hint)
@@ -344,6 +527,7 @@ def inspect_pdf(path: Path) -> DocumentInfo:
         used_ocr=used_ocr,
         error=error,
         text_lines=text_lines,
+        layout_pages=layout_pages,
         id_confidence=id_confidence,
         birth_date_confidence=birth_date_confidence,
         birth_date_out_of_range=birth_date_out_of_range,
@@ -433,18 +617,106 @@ def select_id_candidate(
     return candidate, score
 
 
+_SLASH_BIRTH_DATE_PATTERN = re.compile(
+    r"(?<![\d/])(?P<day>\d{1,2})\s*/\s*(?P<month>\d{1,2})\s*/\s*"
+    r"(?P<year>\d(?:[\s.-]?\d){0,5})(?![\d/-])"
+)
+_OTHER_BIRTH_DATE_PATTERN = re.compile(
+    r"(?<![\d./-])(?P<day>\d{1,2})\s*(?P<separator>[.-])\s*"
+    r"(?P<month>\d{1,2})\s*(?P=separator)\s*"
+    r"(?P<year>\d(?:[\s.-]?\d){0,5})(?![\d/-])"
+)
+_COMPACT_SLASH_BIRTH_DATE_PATTERN = re.compile(
+    r"(?<![\d/])(?P<day>\d{1,2})\s*/\s*(?P<packed>\d{6,8})(?!\d)"
+)
+_PARTIAL_SLASH_BIRTH_DATE_PATTERN = re.compile(
+    r"(?<![\d/])(?P<day>\d{1,2})\s*/\s*(?P<month>\d{1,2})(?![\d/])"
+)
+
+
+def _normalize_ocr_birth_date(
+    day_text: str,
+    month_text: str,
+    year_text: str,
+    inferred_birth_year: int | None,
+) -> str:
+    year_digits = re.sub(r"\D", "", year_text)
+    year_is_uncertain = (
+        len(year_digits) != 4 or bool(re.search(r"[.\s-]", year_text))
+    )
+    if year_is_uncertain and inferred_birth_year is not None:
+        year = inferred_birth_year
+    elif len(year_digits) == 4:
+        year = int(year_digits)
+    elif len(year_digits) == 2:
+        short_year = int(year_digits)
+        year = 2000 + short_year if short_year < 30 else 1900 + short_year
+    else:
+        return ""
+    try:
+        return date(int(year), int(month_text), int(day_text)).strftime("%d/%m/%Y")
+    except ValueError:
+        return ""
+
+
+def extract_ocr_birth_dates(
+    text: str,
+    inferred_birth_year: int | None = None,
+) -> list[str]:
+    def normalize_matches(matches: list[re.Match[str]]) -> list[str]:
+        values = [
+            _normalize_ocr_birth_date(
+                match.group("day"),
+                match.group("month"),
+                match.group("year"),
+                inferred_birth_year,
+            )
+            for match in matches
+        ]
+        return [value for value in values if value]
+
+    values = normalize_matches(list(_SLASH_BIRTH_DATE_PATTERN.finditer(text)))
+    if values:
+        return values
+    values = normalize_matches(list(_OTHER_BIRTH_DATE_PATTERN.finditer(text)))
+    if values:
+        return values
+
+    compact_match = _COMPACT_SLASH_BIRTH_DATE_PATTERN.search(text)
+    if compact_match:
+        packed = compact_match.group("packed")
+        month_text, year_text = packed[:2], packed[2:]
+        value = _normalize_ocr_birth_date(
+            compact_match.group("day"),
+            month_text,
+            year_text,
+            inferred_birth_year,
+        )
+        return [value] if value else []
+
+    if inferred_birth_year is not None:
+        partial_match = _PARTIAL_SLASH_BIRTH_DATE_PATTERN.search(text)
+        if partial_match:
+            value = _normalize_ocr_birth_date(
+                partial_match.group("day"),
+                partial_match.group("month"),
+                str(inferred_birth_year),
+                inferred_birth_year,
+            )
+            return [value] if value else []
+    return []
+
+
 def extract_birth_date_candidate(
     lines: list[tuple[str, float | None]],
     max_line_distance: int = 12,
     min_confidence: float = 50.0,
     today: date | None = None,
     near_line_distance: int = 2,
+    inferred_birth_year: int | None = None,
 ) -> tuple[str | None, float | None, bool, bool, bool]:
-    date_pattern = re.compile(
-        r"(?<!\d)(\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{2,4})(?!\d)"
-    )
     label_pattern = re.compile(
-        r"\b(?:ngay(?: thang nam)? sinh|nam sinh|date of birth|date of binh|dob)\b"
+        r"\b(?:sinh ngay|ngay(?: thang nam)? sinh|nam sinh|date of birth|date of binh|dob)\b"
     )
     labels = [
         index
@@ -457,25 +729,26 @@ def extract_birth_date_candidate(
     def add_dates(text: str, start_line: int, end_line: int, score: float | None) -> None:
         if score is not None and score < min_confidence:
             return
-        for match in date_pattern.finditer(text):
-            value = norm_date(re.sub(r"\s+", "", match.group(1)))
-            if value:
-                date_candidates.append((value, score, start_line, end_line))
+        for value in extract_ocr_birth_dates(text, inferred_birth_year):
+            date_candidates.append((value, score, start_line, end_line))
 
     for index, (text, confidence) in enumerate(lines):
         add_dates(text, index, index, confidence)
         if index + 1 < len(lines):
             next_text, next_confidence = lines[index + 1]
             joined = text + " " + next_text
-            split_at = len(text)
-            for match in date_pattern.finditer(joined):
-                if match.start() < split_at < match.end():
+            individual_values = set(
+                extract_ocr_birth_dates(text, inferred_birth_year)
+                + extract_ocr_birth_dates(next_text, inferred_birth_year)
+            )
+            for value in extract_ocr_birth_dates(joined, inferred_birth_year):
+                if value not in individual_values:
                     score = (
                         (confidence + next_confidence) / 2
                         if confidence is not None and next_confidence is not None
                         else None
                     )
-                    add_dates(match.group(), index, index + 1, score)
+                    date_candidates.append((value, score, index, index + 1))
 
     eligible: list[tuple[str, float | None, int, int, int]] = []
     out_of_range = False
@@ -536,15 +809,128 @@ def extract_birth_date_candidate(
     return value, score, out_of_range, False, used_wide_search
 
 
+def extract_spatial_birth_date_votes(
+    layout_lines: list[
+        tuple[str, float | None, tuple[float, float, float, float]]
+    ],
+    min_confidence: float = 50.0,
+    max_normalized_distance: float = 0.04,
+    today: date | None = None,
+    inferred_birth_year: int | None = None,
+) -> tuple[list[tuple[str, float | None]], bool]:
+    labels = _birth_date_labels(layout_lines, min_confidence)
+    dates: list[
+        tuple[str, float | None, tuple[float, float, float, float], bool]
+    ] = []
+    out_of_range = False
+    for text, score, bounds in layout_lines:
+        for value in extract_ocr_birth_dates(text, inferred_birth_year):
+            plausible = is_plausible_driving_dob(value, today)
+            dates.append((value, score, bounds, plausible))
+
+    votes: list[tuple[str, float | None]] = []
+    for _, _, label_bounds in labels:
+        lx0, ly0, lx1, ly1 = label_bounds
+        nearby_dates = []
+        for value, score, date_bounds, plausible in dates:
+            if score is not None and score < min_confidence:
+                continue
+            dx0, dy0, dx1, dy1 = date_bounds
+            dx = max(0.0, lx0 - dx1, dx0 - lx1)
+            dy = max(0.0, ly0 - dy1, dy0 - ly1)
+            distance = min(dx, dy)
+            if distance > max_normalized_distance:
+                continue
+            if not plausible:
+                out_of_range = True
+                continue
+            nearby_dates.append((distance, value, score))
+        if not nearby_dates:
+            continue
+        nearest_distance = min(candidate[0] for candidate in nearby_dates)
+        nearest = [
+            candidate for candidate in nearby_dates
+            if math.isclose(candidate[0], nearest_distance, abs_tol=0.002)
+        ]
+        nearest_values = {candidate[1] for candidate in nearest}
+        if len(nearest_values) != 1:
+            continue
+        selected = max(
+            nearest, key=lambda candidate: (
+                candidate[2] is not None,
+                candidate[2] if candidate[2] is not None else 0.0,
+            )
+        )
+        votes.append((selected[1], selected[2]))
+    return votes, out_of_range
+
+
 def extract_birth_date_from_pages(
     pages: list[list[tuple[str, float | None]]],
     max_line_distance: int = 12,
     min_confidence: float = 50.0,
     today: date | None = None,
+    layout_pages: list[
+        list[tuple[str, float | None, tuple[float, float, float, float]]] | None
+    ] | None = None,
+    inferred_birth_year: int | None = None,
 ) -> tuple[str | None, float | None, bool, bool, bool]:
+    if layout_pages is not None:
+        votes: list[tuple[str, float | None]] = []
+        out_of_range = False
+        for index, lines in enumerate(pages):
+            layout = layout_pages[index] if index < len(layout_pages) else None
+            if layout is None:
+                candidate = extract_birth_date_candidate(
+                    lines,
+                    max_line_distance,
+                    min_confidence,
+                    today,
+                    inferred_birth_year=inferred_birth_year,
+                )
+                out_of_range |= candidate[2]
+                if candidate[0] is not None:
+                    votes.append((candidate[0], candidate[1]))
+            else:
+                page_votes, page_out_of_range = extract_spatial_birth_date_votes(
+                    layout,
+                    min_confidence=min_confidence,
+                    today=today,
+                    inferred_birth_year=inferred_birth_year,
+                )
+                votes.extend(page_votes)
+                out_of_range |= page_out_of_range
+        if not votes:
+            return None, None, out_of_range, False, False
+
+        vote_weights: dict[str, float] = {}
+        scores: dict[str, list[float]] = {}
+        for value, confidence in votes:
+            effective_confidence = (
+                confidence if confidence is not None else min_confidence
+            )
+            weight = 0.5 + 0.5 * effective_confidence / 100
+            vote_weights[value] = vote_weights.get(value, 0.0) + weight
+            if confidence is not None:
+                scores.setdefault(value, []).append(confidence)
+
+        ranked = sorted(vote_weights.items(), key=lambda item: item[1], reverse=True)
+        if len(ranked) > 1 and ranked[0][1] - ranked[1][1] <= 0.07:
+            return None, None, out_of_range, True, False
+        winner = ranked[0][0]
+        winning_scores = scores.get(winner, [])
+        mean_confidence = (
+            sum(winning_scores) / len(winning_scores) if winning_scores else None
+        )
+        return winner, mean_confidence, out_of_range, False, False
+
     candidates = [
         extract_birth_date_candidate(
-            lines, max_line_distance, min_confidence, today
+            lines,
+            max_line_distance,
+            min_confidence,
+            today,
+            inferred_birth_year=inferred_birth_year,
         )
         for lines in pages
     ]
