@@ -70,9 +70,10 @@ trở lên; nếu điểm thấp hơn 80 hoặc không có điểm, kết quả 
 Khi có nhiều số ID 12 chữ số trong PDF, app chọn số có điểm OCR dòng cao nhất; ba chữ
 số đầu phải từ `001` đến `096` (bao gồm cả hai đầu). Chỉ các ID OCR có điểm từ 60 trở
 lên mới được xét để tránh nhận nhầm chuỗi số nhiễu. Nếu số bị tách qua hai dòng, điểm
-dùng là trung bình hai dòng. ID 9 chữ số không bị loại khi được dùng làm dự phòng từ tên
-file. Bảng quét trực tiếp hiển thị điểm của ID đã chọn. PDF có lớp text và tên file không
-có điểm OCR.
+dùng là trung bình hai dòng. Nếu OCR dính thêm chữ số làm thành chuỗi 13–15 số, app thử
+các cửa sổ 12 số hợp lệ và ưu tiên ID trùng với tên file. ID 9 chữ số không bị loại khi
+được dùng làm dự phòng từ tên file. Bảng quét trực tiếp hiển thị điểm của ID đã chọn.
+PDF có lớp text và tên file không có điểm OCR.
 
 Ngày sinh được tìm trong cùng trang, ưu tiên ngày cách nhãn không quá hai dòng. Chỉ khi
 không có ngày hợp lệ gần nhãn, app mở rộng tìm kiếm tối đa 12 dòng và đánh dấu kết quả

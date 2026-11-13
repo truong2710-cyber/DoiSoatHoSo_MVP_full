@@ -406,6 +406,55 @@ def test_inspect_pdf_prefers_12_digit_content_id_over_filename_id():
         assert info.id_from_pdf
 
 
+def test_inspect_pdf_recovers_valid_id_substring_from_overlong_ocr_digits():
+    cases = [
+        ("001187008952", "1001187008952"),
+        ("033183009701", "10033183009701"),
+        ("001302000802", "1001302000802"),
+        ("033083008215", "10033083008215"),
+        ("033079009842", "10033079009842"),
+        ("033097001450", "10033097001450"),
+        ("001200037461", "061001200037461"),
+    ]
+
+    for expected_id, ocr_line in cases:
+        with tempfile.TemporaryDirectory() as td:
+            pdf_path = Path(td) / f"scan {expected_id}.pdf"
+            document = Document()
+            document.new_page()
+            document.save(pdf_path)
+            with patch(
+                "app.ocr_page",
+                return_value=(" ".join(["recognized"] * 8 + [ocr_line]), 75.0,
+                              [("recognized", 75.0)] * 8 + [(ocr_line, 75.0)]),
+            ):
+                info = inspect_pdf(pdf_path)
+
+            assert info.ids == {expected_id}
+            assert info.id_confidence == 75.0
+            assert info.id_from_pdf
+
+
+def test_overlong_ocr_id_recovery_does_not_accept_invalid_window():
+    with tempfile.TemporaryDirectory() as td:
+        pdf_path = Path(td) / "scan 027074009701.pdf"
+        document = Document()
+        document.new_page()
+        document.save(pdf_path)
+        with patch(
+            "app.ocr_page",
+            return_value=(
+                "recognized text",
+                75.0,
+                [("recognized text", 75.0), ("110427074009701", 75.0)],
+            ),
+        ):
+            info = inspect_pdf(pdf_path)
+
+        assert info.ids == {"027074009701"}
+        assert not info.id_from_pdf
+
+
 def test_inspect_pdf_uses_filename_9_digit_id_when_pdf_has_no_12_digit_id():
     with tempfile.TemporaryDirectory() as td:
         pdf_path = Path(td) / "Bui Quang Tiep 145892756.pdf"
@@ -803,6 +852,8 @@ if __name__ == "__main__":
     test_inspect_pdf_aggregates_ocr_confidence()
     test_inspect_pdf_uses_ocr_id_score_from_pdfplumber_render()
     test_inspect_pdf_prefers_12_digit_content_id_over_filename_id()
+    test_inspect_pdf_recovers_valid_id_substring_from_overlong_ocr_digits()
+    test_overlong_ocr_id_recovery_does_not_accept_invalid_window()
     test_inspect_pdf_uses_filename_9_digit_id_when_pdf_has_no_12_digit_id()
     test_match_document_does_not_use_filename_name_without_pdf_id()
     test_existing_output_can_be_overwritten_or_renamed()

@@ -289,8 +289,22 @@ def inspect_pdf(path: Path) -> DocumentInfo:
         error = str(exc)
     raw = "\n".join(chunks)
     filename_candidates = extract_id_candidates(path.stem, [])
+    filename_ids = {candidate for candidate, _ in filename_candidates}
     pdf_candidates = extract_id_candidates("", text_lines)
-    pdf_candidates = [candidate for candidate in pdf_candidates if len(candidate[0]) == 12]
+    ocr_lines = [(text, score) for text, score in text_lines if score is not None]
+    recovered_candidates = extract_id_candidates(
+        "", ocr_lines, recover_overlong=True
+    )
+    pdf_candidates = [
+        candidate
+        for candidate in (*pdf_candidates, *recovered_candidates)
+        if len(candidate[0]) == 12
+    ]
+    corroborated_candidates = [
+        candidate for candidate in pdf_candidates if candidate[0] in filename_ids
+    ]
+    if corroborated_candidates:
+        pdf_candidates = corroborated_candidates
     selected_id, id_confidence = select_id_candidate(
         pdf_candidates, min_confidence=60.0
     )
@@ -343,6 +357,7 @@ def inspect_pdf(path: Path) -> DocumentInfo:
 def extract_id_candidates(
     filename: str,
     lines: list[tuple[str, float | None]],
+    recover_overlong: bool = False,
 ) -> list[tuple[str, float | None]]:
     candidates: list[tuple[str, float | None]] = []
     seen: dict[str, int] = {}
@@ -366,6 +381,12 @@ def extract_id_candidates(
     for text, score in lines:
         for match in pattern.finditer(text):
             add(match.group(), score)
+        if recover_overlong:
+            overlong_pattern = re.compile(r"(?<!\d)(?:\d[ .-]?){12,14}\d(?!\d)")
+            for match in overlong_pattern.finditer(text):
+                digits = norm_digits(match.group())
+                for start in range(len(digits) - 11):
+                    add(digits[start:start + 12], score)
 
     for index in range(len(lines) - 1):
         first, first_score = lines[index]
