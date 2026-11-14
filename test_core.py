@@ -124,6 +124,21 @@ def test_ocr_birth_date_parser_prefers_slashes_and_uses_id_year_when_malformed()
     assert extract_ocr_birth_dates(
         "DOB 13/1111991", inferred_birth_year=1991
     ) == ["13/11/1991"]
+    assert extract_ocr_birth_dates(
+        "Ngày tinh/Lan dinh 11.07/2003"
+    ) == ["11/07/2003"]
+
+
+def test_spatial_birth_date_vote_parses_huy_mixed_separator_reading():
+    text = "Ngày tinh/Lan dinh 11.07/2003"
+    pages = [[(text, 61.5)]]
+    layout_pages = [[(text, 61.5, (0.1, 0.1, 0.6, 0.15))]]
+
+    assert extract_birth_date_from_pages(
+        pages,
+        today=date(2026, 11, 13),
+        layout_pages=layout_pages,
+    ) == ("11/07/2003", 61.5, False, False, False)
 
 
 def test_vietnamese_id_birth_year_inference_requires_valid_12_digit_id():
@@ -198,6 +213,37 @@ def test_inspect_pdf_retries_rotations_and_keeps_best_dob_evidence():
         assert [call.kwargs.get("rotation_degrees", 0) for call in ocr_mock.call_args_list] == [
             0, 90, -90
         ]
+
+
+def test_inspect_pdf_retries_when_ocr_confidence_is_below_65_percent():
+    with tempfile.TemporaryDirectory() as td:
+        pdf_path = Path(td) / "scan.pdf"
+        document = Document()
+        document.new_page()
+        document.save(pdf_path)
+        unrelated = ("Unrelated text", 64.9, (0.1, 0.1, 0.3, 0.15))
+        dob = ("Date of birth: 23/06/1983", 90.0, (0.1, 0.1, 0.6, 0.15))
+
+        def fake_ocr_page(page, rotation_degrees=0):
+            if rotation_degrees == 0:
+                return "Unrelated text", 64.9, [("Unrelated text", 64.9)], [unrelated]
+            if rotation_degrees == 90:
+                return (
+                    dob[0],
+                    90.0,
+                    [(dob[0], 90.0)],
+                    [dob],
+                )
+            return "Unrelated text", 60.0, [("Unrelated text", 60.0)], [unrelated]
+
+        with patch("app.ocr_page", side_effect=fake_ocr_page) as ocr_mock:
+            info = inspect_pdf(pdf_path)
+
+        assert info.birth_dates == {"23/06/1983"}
+        assert [
+            call.kwargs.get("rotation_degrees", 0)
+            for call in ocr_mock.call_args_list
+        ] == [0, 90, -90]
 
 
 def test_extract_birth_date_from_line_before_label():
@@ -380,7 +426,7 @@ def test_spatial_dob_distance_rejects_candidate_separated_on_both_axes():
     ) == (None, None, False, False, False)
 
 
-def test_spatial_dob_vote_margin_threshold_is_point_zero_seven():
+def test_spatial_dob_vote_margin_threshold_is_point_zero_zero_four():
     pages = [
         [("Date of birth:", 90.0), ("23/06/1983", 90.0)],
         [("Date of birth:", 90.0), ("20/06/1983", 74.0)],
@@ -401,6 +447,29 @@ def test_spatial_dob_vote_margin_threshold_is_point_zero_seven():
         today=date(2026, 11, 13),
         layout_pages=layout_pages,
     ) == ("23/06/1983", 90.0, False, False, False)
+
+
+def test_spatial_dob_vote_margin_at_point_zero_zero_four_is_ambiguous():
+    pages = [
+        [("Date of birth:", 90.0), ("23/06/1983", 90.0)],
+        [("Date of birth:", 90.0), ("20/06/1983", 89.2)],
+    ]
+    layout_pages = [
+        [
+            ("Date of birth:", 90.0, (0.1, 0.1, 0.3, 0.15)),
+            ("23/06/1983", 90.0, (0.1, 0.16, 0.3, 0.2)),
+        ],
+        [
+            ("Date of birth:", 90.0, (0.1, 0.1, 0.3, 0.15)),
+            ("20/06/1983", 89.2, (0.1, 0.16, 0.3, 0.2)),
+        ],
+    ]
+
+    assert extract_birth_date_from_pages(
+        pages,
+        today=date(2026, 11, 13),
+        layout_pages=layout_pages,
+    ) == (None, None, False, True, False)
 
 
 def test_vietnamese_id_format_filter_and_score_selection():
@@ -724,6 +793,25 @@ def test_match_document_does_not_use_filename_name_without_pdf_id():
         filename_id_doc,
         1.0,
     )
+
+
+def test_match_document_prefers_filename_id_match_with_closer_filename_name():
+    worse_name_match = DocumentInfo(
+        Path("Nguyen Huong Vy 030073005631.pdf"),
+        "", set(), set(), set(), "nguyen huong vy", 80.0, True,
+        filename_ids={"030073005631"},
+    )
+    better_name_match = DocumentInfo(
+        Path("Nguyen Luong Huy 030073005631.pdf"),
+        "", set(), set(), set(), "nguyen luong huy", 80.0, True,
+        filename_ids={"030073005631"},
+    )
+
+    assert match_document(
+        "Nguyễn Lương Huy",
+        "030073005631",
+        [worse_name_match, better_name_match],
+    ) == (better_name_match, 1.0)
 
 
 def test_existing_output_can_be_overwritten_or_renamed():
@@ -1074,9 +1162,11 @@ if __name__ == "__main__":
     test_ocr_page_reads_deepdoc_result_text_and_score()
     test_ocr_page_rotates_image_and_maps_boxes_back_to_page_coordinates()
     test_ocr_birth_date_parser_prefers_slashes_and_uses_id_year_when_malformed()
+    test_spatial_birth_date_vote_parses_huy_mixed_separator_reading()
     test_vietnamese_id_birth_year_inference_requires_valid_12_digit_id()
     test_inspect_pdf_infers_uncertain_dob_year_only_from_high_confidence_pdf_id()
     test_inspect_pdf_retries_rotations_and_keeps_best_dob_evidence()
+    test_inspect_pdf_retries_when_ocr_confidence_is_below_65_percent()
     test_extract_birth_date_from_line_before_label()
     test_extract_birth_date_when_ocr_label_has_extra_noise()
     test_extract_birth_date_ignores_low_confidence_label_or_date()
@@ -1089,7 +1179,8 @@ if __name__ == "__main__":
     test_spatial_dob_vote_tie_requires_manual_review()
     test_spatial_dob_distance_uses_smaller_axis_gap_for_same_row()
     test_spatial_dob_distance_rejects_candidate_separated_on_both_axes()
-    test_spatial_dob_vote_margin_threshold_is_point_zero_seven()
+    test_spatial_dob_vote_margin_threshold_is_point_zero_zero_four()
+    test_spatial_dob_vote_margin_at_point_zero_zero_four_is_ambiguous()
     test_vietnamese_id_format_filter_and_score_selection()
     test_id_selection_prefers_highest_confidence_candidate()
     test_id_selection_prioritizes_12_digits_over_9_digits()
@@ -1107,6 +1198,7 @@ if __name__ == "__main__":
     test_overlong_ocr_id_recovery_does_not_accept_invalid_window()
     test_inspect_pdf_uses_filename_9_digit_id_when_pdf_has_no_12_digit_id()
     test_match_document_does_not_use_filename_name_without_pdf_id()
+    test_match_document_prefers_filename_id_match_with_closer_filename_name()
     test_existing_output_can_be_overwritten_or_renamed()
     test_end_to_end_text_pdf()
     test_pdf_with_exact_id_is_not_assigned_to_multiple_rows()

@@ -81,12 +81,15 @@ hàng hoặc cùng cột với nhãn vẫn có thể ghép dù cách xa theo tr�
 nhãn/ngày là một lượt bầu độc lập, kể cả khi có nhiều lượt trên cùng một trang. Mỗi lượt
 có trọng số `0.5 + 0.5 × (điểm OCR / 100)`, vì vậy ngày được
 nhận diện lặp lại có thể thắng một lần đọc có điểm cao hơn. Nếu tổng trọng số của hai
-ngày đứng đầu chênh nhau không quá `0.07`, kết quả được để trống và yêu cầu kiểm tra thủ
+ngày đứng đầu chênh nhau không quá `0.004`, kết quả được để trống và yêu cầu kiểm tra thủ
 công. Khi OCR năm sinh bị lỗi định dạng hoặc thiếu chữ số, app có thể dùng năm suy ra từ
 CCCD 12 số đọc trực tiếp từ PDF với điểm OCR từ 80 trở lên; tên file không được dùng để
 suy ra năm. Cách đọc ưu tiên ngày có dấu `/` trước dấu `.`. Khi OCR không đọc được ngày
-sinh đáng tin cậy, app thử OCR lại trang khi xoay `+90°` và `-90°`, rồi chọn kết quả có
-bằng chứng ngày sinh/CCCD tốt hơn. Khi thiếu tọa độ OCR, app dùng cách tìm theo dòng: ưu
+sinh đáng tin cậy, app thử OCR lại trang khi xoay `+90°` và `-90°` nếu điểm OCR dưới
+65%, nhãn ngày sinh chưa có ngày đọc được, hoặc ID yếu. Khi tài liệu đã có nhãn ngày sinh
+nhưng chưa tìm được ngày, các trang OCR tiếp theo cũng được thử xoay. Parser chấp nhận
+các dấu phân cách ngày hỗn hợp như `11.07/2003` và một số lỗi OCR thường gặp trong nhãn
+`Ngày sinh`, rồi chọn kết quả có bằng chứng ngày sinh/CCCD tốt hơn. Khi thiếu tọa độ OCR, app dùng cách tìm theo dòng: ưu
 tiên ngày cách nhãn không quá hai dòng, sau đó mới mở rộng tối đa 12 dòng và đánh dấu
 kết quả cần kiểm tra thủ công. Ngày phải trong khoảng 18–100 tuổi tính đến ngày chạy app.
 Khoảng tuổi này là bộ lọc hợp lý do người dùng chọn cho hồ sơ bằng lái, không phải kết

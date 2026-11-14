@@ -291,7 +291,7 @@ def _birth_date_labels(
     min_confidence: float = 50.0,
 ) -> list[tuple[str, float | None, tuple[float, float, float, float]]]:
     label_pattern = re.compile(
-        r"\b(?:sinh ngay|ngay(?: thang nam)? sinh|nam sinh|date of birth|date of binh|dob)\b"
+        r"\b(?:sinh ngay|ngay(?: thang nam)? (?:sinh|tinh)|nam sinh|date of birth|date of binh|dob)\b"
     )
     return [
         line
@@ -338,6 +338,8 @@ def _retry_ocr_orientation(
     layout: list[
         tuple[str, float | None, tuple[float, float, float, float]]
     ],
+    document_has_birth_date_label: bool = False,
+    document_has_birth_date: bool = False,
 ) -> bool:
     labels = _birth_date_labels(layout)
     votes, _ = extract_spatial_birth_date_votes(layout)
@@ -350,9 +352,15 @@ def _retry_ocr_orientation(
         id_confidence is None or id_confidence < 80.0
     )
     return (
-        (bool(labels) and not high_confidence_vote)
+        (
+            (
+                bool(labels)
+                or (document_has_birth_date_label and not document_has_birth_date)
+            )
+            and not high_confidence_vote
+        )
         or weak_id
-        or (confidence < 60.0 and not high_confidence_vote)
+        or (confidence < 65.0 and not high_confidence_vote)
     )
 
 
@@ -384,6 +392,8 @@ def inspect_pdf(path: Path) -> DocumentInfo:
     chunks, ocr_scores, text_lines, text_pages, layout_pages, used_ocr, error = (
         [], [], [], [], [], False, ""
     )
+    document_has_birth_date_label = False
+    document_has_birth_date = False
     try:
         with fitz.open(path) as doc:
             render_doc = None
@@ -406,8 +416,15 @@ def inspect_pdf(path: Path) -> DocumentInfo:
                             render_doc.pages[page_index]
                         )
                         base_page_lines = list(page_lines)
+                        document_has_birth_date_label |= bool(
+                            _birth_date_labels(page_layout)
+                        )
                         if page_layout and _retry_ocr_orientation(
-                            page_lines, conf, page_layout
+                            page_lines,
+                            conf,
+                            page_layout,
+                            document_has_birth_date_label,
+                            document_has_birth_date,
                         ):
                             base_labels = _birth_date_labels(page_layout)
                             best_quality, _ = _orientation_quality(
@@ -453,6 +470,10 @@ def inspect_pdf(path: Path) -> DocumentInfo:
                                 page_layout = effective_layout
                         chunks.append(ocr_text)
                         ocr_scores.append((conf, max(len(re.sub(r"\s", "", ocr_text)), 1)))
+                    document_has_birth_date |= any(
+                        extract_ocr_birth_dates(line)
+                        for line, _ in page_lines
+                    )
                     text_lines.extend(page_lines)
                     text_pages.append(page_lines)
                     layout_pages.append(page_layout or None)
@@ -622,8 +643,8 @@ _SLASH_BIRTH_DATE_PATTERN = re.compile(
     r"(?P<year>\d(?:[\s.-]?\d){0,5})(?![\d/-])"
 )
 _OTHER_BIRTH_DATE_PATTERN = re.compile(
-    r"(?<![\d./-])(?P<day>\d{1,2})\s*(?P<separator>[.-])\s*"
-    r"(?P<month>\d{1,2})\s*(?P=separator)\s*"
+    r"(?<![\d./-])(?P<day>\d{1,2})\s*[./-]\s*"
+    r"(?P<month>\d{1,2})\s*[./-]\s*"
     r"(?P<year>\d(?:[\s.-]?\d){0,5})(?![\d/-])"
 )
 _COMPACT_SLASH_BIRTH_DATE_PATTERN = re.compile(
@@ -716,7 +737,7 @@ def extract_birth_date_candidate(
     inferred_birth_year: int | None = None,
 ) -> tuple[str | None, float | None, bool, bool, bool]:
     label_pattern = re.compile(
-        r"\b(?:sinh ngay|ngay(?: thang nam)? sinh|nam sinh|date of birth|date of binh|dob)\b"
+        r"\b(?:sinh ngay|ngay(?: thang nam)? (?:sinh|tinh)|nam sinh|date of birth|date of binh|dob)\b"
     )
     labels = [
         index
@@ -915,7 +936,10 @@ def extract_birth_date_from_pages(
                 scores.setdefault(value, []).append(confidence)
 
         ranked = sorted(vote_weights.items(), key=lambda item: item[1], reverse=True)
-        if len(ranked) > 1 and ranked[0][1] - ranked[1][1] <= 0.07:
+        if (
+            len(ranked) > 1
+            and ranked[0][1] - ranked[1][1] <= 0.004 + 1e-12
+        ):
             return None, None, out_of_range, True, False
         winner = ranked[0][0]
         winning_scores = scores.get(winner, [])
@@ -1015,7 +1039,14 @@ def match_document(
             if any(ids_match(citizen_id, candidate) for candidate in d.filename_ids)
         ]
         if exact_filename_ids:
-            return exact_filename_ids[0], 1.0
+            normalized_name = norm_text(name)
+            best_match = max(
+                exact_filename_ids,
+                key=lambda doc: SequenceMatcher(
+                    None, normalized_name, doc.name_hint
+                ).ratio(),
+            )
+            return best_match, 1.0
     if not allow_name_fallback:
         return None, 0.0
     n = norm_text(name)
