@@ -12,3 +12,10 @@ ruamel.yaml
 cachetools
 six
 vietocr==0.3.13
+PyYAML
+torchvision
+einops
+requests
+pycryptodomex
+filelock
+strenum

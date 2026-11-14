@@ -1,0 +1,66 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Download OCR model assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force -Path model-assets | Out-Null
+          gh release download ocr-models-v1 --repo $env:GITHUB_REPOSITORY --dir model-assets
+
+          $detector = "model-assets/det.onnx"
+          $recognizer = "model-assets/vgg_seq2seq.pth"
+          if (!(Test-Path $detector) -or !(Test-Path $recognizer)) {
+            throw "Release ocr-models-v1 must contain det.onnx and vgg_seq2seq.pth."
+          }
+
+          $detectorHash = (Get-FileHash $detector -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($detectorHash -ne "30a86f5731181461d08021402766601e4302a9b9b9666be8aff402696339cdff") {
+            throw "det.onnx failed SHA-256 verification."
+          }
+
+          $recognizerHash = (Get-FileHash $recognizer -Algorithm MD5).Hash.ToLowerInvariant()
+          if ($recognizerHash -ne "efcabaa6d3adfca8e52bda2fd7d2ee04") {
+            throw "vgg_seq2seq.pth failed MD5 verification."
+          }
+
+          New-Item -ItemType Directory -Force -Path deepdoc_vietocr/onnx | Out-Null
+          New-Item -ItemType Directory -Force -Path deepdoc_vietocr/vietocr/weight | Out-Null
+          Copy-Item $detector deepdoc_vietocr/onnx/det.onnx
+          Copy-Item $recognizer deepdoc_vietocr/vietocr/weight/vgg_seq2seq.pth
+
+      - name: Build executable
+        shell: cmd
+        run: build_windows.bat
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: DoiSoatHoSo-windows-x64
+          path: dist/DoiSoatHoSo.exe
+          if-no-files-found: error
+          retention-days: 14

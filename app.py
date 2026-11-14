@@ -1,27 +1,41 @@
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import json
 import math
+import multiprocessing as mp
 import os
+import pickle
 import re
 import subprocess
 import sys
 import threading
+import time
 import unicodedata
+from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from queue import Empty, Queue
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
-import fitz
+import fitz  # PyMuPDF: dùng cho cả đọc text lẫn render ảnh (đã bỏ pdfplumber)
 import numpy as np
 import pandas as pd
-import pdfplumber
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+
+try:  # tùy chọn: pip install psutil để đo CPU chính xác hơn
+    import psutil
+except ImportError:
+    psutil = None
 
 
 APP_NAME = "Đối soát hồ sơ"
@@ -29,6 +43,30 @@ OUTPUT_COLUMNS = [
     "Trạng thái đối soát", "Chi tiết sai lệch", "Độ tin cậy OCR",
     "Đường dẫn tài liệu", "Ghi chú kiểm tra thủ công",
 ]
+
+# ----------------------------------------------------------------------------
+# Cấu hình tốc độ (chỉnh ở đây)
+# ----------------------------------------------------------------------------
+OCR_DPI = 150            # trước đây 216. Nếu OCR sai nhiều thì thử 180.
+MAX_IMAGE_SIDE = 1800    # cạnh dài tối đa của ảnh đưa vào OCR (px)
+MAX_PAGES = 8            # số trang tối đa mỗi PDF
+MAX_WORKERS = 6          # trần cứng; số worker thực tế tự thích ứng theo RAM/CPU
+WORKER_RAM_GB = 1.5      # RAM ước tính mỗi tiến trình OCR
+MIN_FREE_RAM_GB = 1.0    # luôn chừa lại ngần này RAM trống cho Windows
+CPU_TARGET_PERCENT = 85  # CPU dưới mức này thì mới tăng thêm worker
+USE_CACHE = True         # lưu kết quả quét để lần chạy sau không OCR lại
+CACHE_VERSION = "v3-fitz150-earlyexit"   # đổi chuỗi này khi sửa logic trích xuất
+CACHE_DIR = Path.home() / ".doi_soat_cache"
+CACHE_SAVE_EVERY = 25    # lưu cache định kỳ để lỡ tắt app vẫn giữ được tiến độ
+
+OCR_THREADS = os.cpu_count() or 2  # được ghi đè trong từng tiến trình con
+
+
+class CancelledByUser(Exception):
+    """Người dùng bấm Hủy."""
+
+
+CANCEL_EVENT = threading.Event()
 
 
 def resource_dir() -> Path:
@@ -150,6 +188,9 @@ def alternate_norm_date(value) -> str:
         return ""
 
 
+# ----------------------------------------------------------------------------
+# OCR engine
+# ----------------------------------------------------------------------------
 _DEEPDOC_OCR = None
 _DEEPDOC_OCR_LOCK = threading.Lock()
 
@@ -181,8 +222,28 @@ def get_deepdoc_ocr():
                     raise RuntimeError(
                         "Thiếu thư viện DeepDoc OCR. Hãy cài các gói trong requirements.txt."
                     ) from exc
-                _DEEPDOC_OCR = OCR()
+                engine = OCR()
+                # Giới hạn số luồng PyTorch để nhiều tiến trình không tranh CPU nhau.
+                try:
+                    import torch
+
+                    torch.set_num_threads(max(1, OCR_THREADS))
+                except Exception:
+                    pass
+                _DEEPDOC_OCR = engine
     return _DEEPDOC_OCR
+
+
+@contextlib.contextmanager
+def _inference_context():
+    """torch.inference_mode() nếu có torch: nhanh hơn và ít RAM hơn."""
+    try:
+        import torch
+
+        with torch.inference_mode():
+            yield
+    except ImportError:
+        yield
 
 
 def open_folder(path: Path):
@@ -231,8 +292,29 @@ def confirm_output_path(path: Path) -> Path | None:
         initial_name = renamed_path.name
 
 
+def render_page(page: fitz.Page) -> np.ndarray:
+    """Render trang bằng PyMuPDF (nhanh hơn pdfplumber nhiều), ảnh RGB."""
+    rect = page.rect
+    scale = OCR_DPI / 72.0
+    longest = max(rect.width, rect.height) * scale
+    if longest > MAX_IMAGE_SIDE:
+        scale *= MAX_IMAGE_SIDE / longest
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False
+    )
+    image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+        pix.height, pix.width, 3
+    )
+    return image.copy()
+
+
+def is_blank_image(image: np.ndarray) -> bool:
+    """Trang trắng/gần trắng: bỏ qua OCR để tiết kiệm vài giây."""
+    return float(image[::8, ::8].std()) < 2.0
+
+
 def ocr_page(
-    page: pdfplumber.page.Page,
+    page: fitz.Page,
     rotation_degrees: int = 0,
 ) -> tuple[
     str,
@@ -240,13 +322,15 @@ def ocr_page(
     list[tuple[str, float]],
     list[tuple[str, float, tuple[float, float, float, float]]],
 ]:
-    image = np.array(page.to_image(resolution=216).annotated)
     if rotation_degrees not in (0, 90, -90):
         raise ValueError("rotation_degrees must be 0, 90, or -90")
+    image = render_page(page)
+    if is_blank_image(image):
+        return "", 0.0, [], []
     if rotation_degrees:
         image = np.rot90(image, k=-rotation_degrees // 90).copy()
-    print("Đang OCR trang PDF bằng DeepDoc + VietOCR...")
-    results = get_deepdoc_ocr()(image)
+    with _inference_context():
+        results = get_deepdoc_ocr()(image)
     recognized = []
     layout_lines = []
     for box, (text, score) in (results or []):
@@ -286,18 +370,22 @@ def ocr_page(
     ], layout_lines
 
 
+_BIRTH_LABEL_PATTERN = re.compile(
+    r"\b(?:sinh ngay|ngay(?: thang nam)? (?:sinh|tinh)|nam sinh|date of birth|date of binh|dob)\b"
+)
+_OVERLONG_ID_PATTERN = re.compile(r"(?<!\d)(?:\d[ .-]?){12,14}\d(?!\d)")
+_ID_PATTERN = re.compile(r"(?<!\d)(?:\d[ .-]?){8,11}\d(?!\d)")
+
+
 def _birth_date_labels(
     lines: list[tuple[str, float | None, tuple[float, float, float, float]]],
     min_confidence: float = 50.0,
 ) -> list[tuple[str, float | None, tuple[float, float, float, float]]]:
-    label_pattern = re.compile(
-        r"\b(?:sinh ngay|ngay(?: thang nam)? (?:sinh|tinh)|nam sinh|date of birth|date of binh|dob)\b"
-    )
     return [
         line
         for line in lines
         if (line[1] is None or line[1] >= min_confidence)
-        and label_pattern.search(norm_text(line[0]))
+        and _BIRTH_LABEL_PATTERN.search(norm_text(line[0]))
     ]
 
 
@@ -364,6 +452,27 @@ def _retry_ocr_orientation(
     )
 
 
+def _has_confident_id_and_dob(
+    ocr_lines: list[tuple[str, float | None]],
+    layouts: list,
+) -> bool:
+    """Đã có CCCD 12 số (>=80%) và ngày sinh (>=80%) từ OCR -> khỏi OCR thêm trang."""
+    scored = [(t, s) for t, s in ocr_lines if s is not None]
+    if not scored:
+        return False
+    candidates = extract_id_candidates("", scored, recover_overlong=True)
+    selected, conf = select_id_candidate(candidates, min_confidence=60.0)
+    if not selected or len(selected) != 12 or conf is None or conf < 80.0:
+        return False
+    for layout in layouts:
+        if not layout:
+            continue
+        votes, _ = extract_spatial_birth_date_votes(layout)
+        if any(score is not None and score >= 80.0 for _, score in votes):
+            return True
+    return False
+
+
 @dataclass
 class DocumentInfo:
     path: Path
@@ -394,92 +503,102 @@ def inspect_pdf(path: Path) -> DocumentInfo:
     )
     document_has_birth_date_label = False
     document_has_birth_date = False
+    skip_further_ocr = False   # đã đủ CCCD + ngày sinh tin cậy -> bỏ OCR các trang sau
+    good_rotation: int | None = None
+    ocr_only_lines: list[tuple[str, float | None]] = []
     try:
         with fitz.open(path) as doc:
-            render_doc = None
-            try:
-                for page_index, page in enumerate(list(doc)[:8]):
-                    text = page.get_text("text").strip()
-                    if len(re.sub(r"\s", "", text)) >= 40:
-                        chunks.append(text)
-                        page_lines = [
-                            (line.strip(), None)
-                            for line in text.splitlines()
-                            if line.strip()
-                        ]
-                        page_layout = None
-                    else:
-                        used_ocr = True
-                        if render_doc is None:
-                            render_doc = pdfplumber.open(path)
-                        ocr_text, conf, page_lines, page_layout = ocr_page(
-                            render_doc.pages[page_index]
-                        )
-                        base_page_lines = list(page_lines)
-                        document_has_birth_date_label |= bool(
-                            _birth_date_labels(page_layout)
-                        )
-                        if page_layout and _retry_ocr_orientation(
-                            page_lines,
-                            conf,
-                            page_layout,
-                            document_has_birth_date_label,
-                            document_has_birth_date,
-                        ):
-                            base_labels = _birth_date_labels(page_layout)
-                            best_quality, _ = _orientation_quality(
-                                page_lines, page_layout
-                            )
-                            for rotation in (90, -90):
-                                (
-                                    rotated_text,
-                                    rotated_conf,
-                                    rotated_lines,
-                                    rotated_layout,
-                                ) = ocr_page(
-                                    render_doc.pages[page_index],
-                                    rotation_degrees=rotation,
-                                )
-                                quality, effective_layout = _orientation_quality(
-                                    rotated_lines,
-                                    rotated_layout,
-                                    context_labels=base_labels,
-                                )
-                                if quality <= best_quality:
-                                    continue
-                                best_quality = quality
-                                ocr_text = rotated_text
-                                conf = rotated_conf
-                                page_lines = list(rotated_lines)
-                                if not _birth_date_labels(rotated_layout):
-                                    page_lines.extend(
-                                        (text, score)
-                                        for text, score, _ in base_labels
-                                    )
-                                rotated_ids = extract_id_candidates(
-                                    "", page_lines, recover_overlong=True
-                                )
-                                if not rotated_ids:
-                                    page_lines.extend(
-                                        line
-                                        for line in base_page_lines
-                                        if extract_id_candidates(
-                                            "", [line], recover_overlong=True
-                                        )
-                                    )
-                                page_layout = effective_layout
-                        chunks.append(ocr_text)
-                        ocr_scores.append((conf, max(len(re.sub(r"\s", "", ocr_text)), 1)))
-                    document_has_birth_date |= any(
-                        extract_ocr_birth_dates(line)
-                        for line, _ in page_lines
+            for page_index in range(min(len(doc), MAX_PAGES)):
+                page = doc[page_index]
+                text = page.get_text("text").strip()
+                if len(re.sub(r"\s", "", text)) >= 40:
+                    chunks.append(text)
+                    page_lines = [
+                        (line.strip(), None)
+                        for line in text.splitlines()
+                        if line.strip()
+                    ]
+                    page_layout = None
+                else:
+                    if skip_further_ocr:
+                        continue
+                    used_ocr = True
+                    ocr_text, conf, page_lines, page_layout = ocr_page(page)
+                    base_page_lines = list(page_lines)
+                    document_has_birth_date_label |= bool(
+                        _birth_date_labels(page_layout)
                     )
-                    text_lines.extend(page_lines)
-                    text_pages.append(page_lines)
-                    layout_pages.append(page_layout or None)
-            finally:
-                if render_doc is not None:
-                    render_doc.close()
+                    if page_layout and _retry_ocr_orientation(
+                        page_lines,
+                        conf,
+                        page_layout,
+                        document_has_birth_date_label,
+                        document_has_birth_date,
+                    ):
+                        base_labels = _birth_date_labels(page_layout)
+                        best_quality, _ = _orientation_quality(
+                            page_lines, page_layout
+                        )
+                        # Nếu trang trước đã phải xoay thì thử đúng chiều đó trước.
+                        rotations = (-90, 90) if good_rotation == -90 else (90, -90)
+                        for rotation in rotations:
+                            (
+                                rotated_text,
+                                rotated_conf,
+                                rotated_lines,
+                                rotated_layout,
+                            ) = ocr_page(page, rotation_degrees=rotation)
+                            quality, effective_layout = _orientation_quality(
+                                rotated_lines,
+                                rotated_layout,
+                                context_labels=base_labels,
+                            )
+                            if quality <= best_quality:
+                                continue
+                            best_quality = quality
+                            good_rotation = rotation
+                            ocr_text = rotated_text
+                            conf = rotated_conf
+                            page_lines = list(rotated_lines)
+                            if not _birth_date_labels(rotated_layout):
+                                page_lines.extend(
+                                    (t, s) for t, s, _ in base_labels
+                                )
+                            rotated_ids = extract_id_candidates(
+                                "", page_lines, recover_overlong=True
+                            )
+                            if not rotated_ids:
+                                page_lines.extend(
+                                    line
+                                    for line in base_page_lines
+                                    if extract_id_candidates(
+                                        "", [line], recover_overlong=True
+                                    )
+                                )
+                            page_layout = effective_layout
+                            # Kết quả đã đủ tốt -> không cần thử hướng còn lại.
+                            if not _retry_ocr_orientation(
+                                page_lines,
+                                conf,
+                                page_layout,
+                                document_has_birth_date_label,
+                                document_has_birth_date,
+                            ):
+                                break
+                    chunks.append(ocr_text)
+                    ocr_scores.append((conf, max(len(re.sub(r"\s", "", ocr_text)), 1)))
+                    ocr_only_lines.extend(page_lines)
+                document_has_birth_date |= any(
+                    extract_ocr_birth_dates(line)
+                    for line, _ in page_lines
+                )
+                text_lines.extend(page_lines)
+                text_pages.append(page_lines)
+                layout_pages.append(page_layout or None)
+                if used_ocr and not skip_further_ocr:
+                    skip_further_ocr = _has_confident_id_and_dob(
+                        ocr_only_lines, layout_pages
+                    )
     except Exception as exc:
         error = str(exc)
     raw = "\n".join(chunks)
@@ -580,15 +699,13 @@ def extract_id_candidates(
             if old_score is None or score > old_score:
                 candidates[index] = (digits, score)
 
-    pattern = re.compile(r"(?<!\d)(?:\d[ .-]?){8,11}\d(?!\d)")
-    for match in pattern.finditer(filename):
+    for match in _ID_PATTERN.finditer(filename):
         add(match.group(), None)
     for text, score in lines:
-        for match in pattern.finditer(text):
+        for match in _ID_PATTERN.finditer(text):
             add(match.group(), score)
         if recover_overlong:
-            overlong_pattern = re.compile(r"(?<!\d)(?:\d[ .-]?){12,14}\d(?!\d)")
-            for match in overlong_pattern.finditer(text):
+            for match in _OVERLONG_ID_PATTERN.finditer(text):
                 digits = norm_digits(match.group())
                 for start in range(len(digits) - 11):
                     add(digits[start:start + 12], score)
@@ -736,14 +853,11 @@ def extract_birth_date_candidate(
     near_line_distance: int = 2,
     inferred_birth_year: int | None = None,
 ) -> tuple[str | None, float | None, bool, bool, bool]:
-    label_pattern = re.compile(
-        r"\b(?:sinh ngay|ngay(?: thang nam)? (?:sinh|tinh)|nam sinh|date of birth|date of binh|dob)\b"
-    )
     labels = [
         index
         for index, (text, confidence) in enumerate(lines)
         if (confidence is None or confidence >= min_confidence)
-        and label_pattern.search(norm_text(text))
+        and _BIRTH_LABEL_PATTERN.search(norm_text(text))
     ]
     date_candidates: list[tuple[str, float | None, int, int]] = []
 
@@ -840,6 +954,9 @@ def extract_spatial_birth_date_votes(
     inferred_birth_year: int | None = None,
 ) -> tuple[list[tuple[str, float | None]], bool]:
     labels = _birth_date_labels(layout_lines, min_confidence)
+    if not labels:
+        # Không có nhãn "ngày sinh" thì không thể có phiếu bầu -> khỏi parse ngày.
+        return [], False
     dates: list[
         tuple[str, float | None, tuple[float, float, float, float], bool]
     ] = []
@@ -1014,10 +1131,10 @@ ALIASES = {
 def detect_columns(columns) -> dict[str, str | None]:
     normalized = {c: norm_text(c) for c in columns}
     result = {}
-    for field, aliases in ALIASES.items():
-        result[field] = next((c for c, n in normalized.items() if n in aliases), None)
-        if not result[field]:
-            result[field] = next((c for c, n in normalized.items() if any(a in n for a in aliases)), None)
+    for field_name, aliases in ALIASES.items():
+        result[field_name] = next((c for c, n in normalized.items() if n in aliases), None)
+        if not result[field_name]:
+            result[field_name] = next((c for c, n in normalized.items() if any(a in n for a in aliases)), None)
     return result
 
 
@@ -1063,6 +1180,18 @@ def match_document(
     return (ranked[0][1], ranked[0][0]) if ranked and ranked[0][0] >= 0.67 else (None, ranked[0][0] if ranked else 0.0)
 
 
+def _ratio_at_least(a: str, b: str, threshold: float) -> float:
+    """SequenceMatcher.ratio() nhưng loại nhanh các cặp chắc chắn dưới ngưỡng.
+
+    real_quick_ratio / quick_ratio là cận trên của ratio(), nên kết quả
+    (so với ngưỡng) giống hệt việc gọi ratio() trực tiếp nhưng nhanh hơn nhiều.
+    """
+    matcher = SequenceMatcher(None, a, b)
+    if matcher.real_quick_ratio() < threshold or matcher.quick_ratio() < threshold:
+        return 0.0
+    return matcher.ratio()
+
+
 def filename_similarity(
     name: str, citizen_id: str, doc: DocumentInfo
 ) -> tuple[float, float, float] | None:
@@ -1071,13 +1200,15 @@ def filename_similarity(
     if not normalized_name or not normalized_id or not doc.name_hint or not doc.filename_ids:
         return None
 
-    name_score = SequenceMatcher(None, normalized_name, doc.name_hint).ratio()
+    name_score = _ratio_at_least(normalized_name, doc.name_hint, 0.85)
+    if name_score < 0.85:
+        return None
     id_score = max(
         1.0 if ids_match(normalized_id, filename_id)
-        else SequenceMatcher(None, normalized_id, filename_id).ratio()
+        else _ratio_at_least(normalized_id, filename_id, 0.85)
         for filename_id in doc.filename_ids
     )
-    if name_score < 0.85 or id_score < 0.85:
+    if id_score < 0.85:
         return None
     return (name_score + id_score) / 2, name_score, id_score
 
@@ -1106,12 +1237,11 @@ def assign_filename_similarity_matches(
                 exact_docs.add(doc.path)
 
     candidates = []
+    remaining_docs = [doc for doc in docs if doc.path not in exact_docs]
     for row_index, (name, citizen_id) in enumerate(row_values):
         if row_index in exact_rows:
             continue
-        for doc in docs:
-            if doc.path in exact_docs:
-                continue
+        for doc in remaining_docs:
             scores = filename_similarity(name, citizen_id, doc)
             if scores:
                 combined, name_score, id_score = scores
@@ -1131,6 +1261,243 @@ def assign_filename_similarity_matches(
     return assignments
 
 
+# ----------------------------------------------------------------------------
+# Cache + quét PDF song song
+# ----------------------------------------------------------------------------
+def _cache_file(pdf_dir: Path) -> Path:
+    key = hashlib.md5(str(pdf_dir.resolve()).encode("utf-8")).hexdigest()[:12]
+    return CACHE_DIR / f"scan_{key}.pkl"
+
+
+def _load_cache(pdf_dir: Path) -> dict:
+    if not USE_CACHE:
+        return {}
+    try:
+        with open(_cache_file(pdf_dir), "rb") as handle:
+            payload = pickle.load(handle)
+        if payload.get("version") == CACHE_VERSION:
+            return payload.get("items", {})
+    except Exception:
+        pass
+    return {}
+
+
+def _save_cache(pdf_dir: Path, items: dict) -> None:
+    if not USE_CACHE:
+        return
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        target = _cache_file(pdf_dir)
+        temp = target.with_suffix(".tmp")
+        with open(temp, "wb") as handle:
+            pickle.dump({"version": CACHE_VERSION, "items": items}, handle)
+        os.replace(temp, target)
+    except Exception:
+        pass  # cache lỗi không được làm hỏng quá trình đối soát
+
+
+def _file_signature(path: Path) -> tuple[int, int]:
+    stat = path.stat()
+    return stat.st_size, stat.st_mtime_ns
+
+
+def _init_worker(threads: int) -> None:
+    """Chạy một lần trong mỗi tiến trình con: giới hạn số luồng để không tranh CPU."""
+    global OCR_THREADS
+    OCR_THREADS = max(1, threads)
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[name] = str(OCR_THREADS)
+
+
+def _error_info(path: Path, exc: Exception) -> DocumentInfo:
+    return DocumentInfo(
+        path=path, text="", ids=set(), dates=set(), birth_dates=set(),
+        name_hint=norm_text(re.sub(r"\b\d[\d ._-]*\b", " ", path.stem)),
+        confidence=None, used_ocr=False, error=str(exc),
+        filename_ids={c for c, _ in extract_id_candidates(path.stem, [])},
+    )
+
+
+def available_ram_gb() -> float | None:
+    """RAM còn trống (GB). Trả None nếu không đo được."""
+    if psutil is not None:
+        return psutil.virtual_memory().available / 2**30
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MemoryStatus()
+            stat.dwLength = ctypes.sizeof(MemoryStatus)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            return stat.ullAvailPhys / 2**30
+        except Exception:
+            return None
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 2**20
+    except OSError:
+        pass
+    return None
+
+
+def cpu_percent() -> float | None:
+    if psutil is None:
+        return None
+    return psutil.cpu_percent(interval=None)
+
+
+def choose_worker_plan(pending: int) -> tuple[int, int]:
+    """Số worker tối đa = min(số nhân - 1, số worker mà RAM trống chịu được)."""
+    cores = os.cpu_count() or 2
+    by_cpu = max(1, cores - 1)
+    ram = available_ram_gb()
+    by_ram = (
+        max(1, int((ram - MIN_FREE_RAM_GB) // WORKER_RAM_GB)) if ram is not None else 2
+    )
+    workers = max(1, min(by_cpu, by_ram, MAX_WORKERS, pending))
+    threads = max(1, round(cores / workers))
+    return workers, threads
+
+
+def adapt_concurrency(limit: int, workers: int) -> int:
+    """Tăng/giảm số PDF xử lý đồng thời theo RAM và CPU đang rảnh."""
+    ram = available_ram_gb()
+    if ram is not None and ram < MIN_FREE_RAM_GB:
+        return max(1, limit - 1)          # sắp thiếu RAM -> giảm
+    cpu = cpu_percent()
+    has_ram_for_more = ram is None or ram > WORKER_RAM_GB + MIN_FREE_RAM_GB
+    cpu_has_room = cpu is None or cpu < CPU_TARGET_PERCENT
+    if limit < workers and has_ram_for_more and cpu_has_room:
+        return limit + 1                  # còn dư RAM và CPU -> tăng
+    return limit
+
+
+def scan_pdfs(pdfs: list[Path], pdf_dir: Path, progress, on_scan) -> list[DocumentInfo]:
+    total = len(pdfs)
+    docs: list[DocumentInfo | None] = [None] * total
+    cache = _load_cache(pdf_dir)
+    done = 0
+    pending: list[int] = []
+
+    for index, path in enumerate(pdfs):
+        hit = None
+        try:
+            size, mtime = _file_signature(path)
+            entry = cache.get(str(path.resolve()))
+            if entry and entry[0] == size and entry[1] == mtime:
+                hit = entry[2]
+        except OSError:
+            pass
+        if hit is not None:
+            hit.path = path
+            docs[index] = hit
+            done += 1
+            progress("scan", done, total, f"Đã có trong cache: {path.name}")
+            if on_scan:
+                on_scan(index + 1, total, path, "start", None)
+                on_scan(index + 1, total, path, "done", hit)
+        else:
+            pending.append(index)
+
+    def finish(index: int, info: DocumentInfo) -> None:
+        nonlocal done
+        path = pdfs[index]
+        docs[index] = info
+        done += 1
+        if not info.error:
+            try:
+                size, mtime = _file_signature(path)
+                cache[str(path.resolve())] = (size, mtime, info)
+            except OSError:
+                pass
+        progress("scan", done, total, f"Đã đọc {path.name}")
+        if on_scan:
+            on_scan(index + 1, total, path, "done", info)
+        if done % CACHE_SAVE_EVERY == 0:
+            _save_cache(pdf_dir, cache)
+
+    def check_cancel() -> None:
+        if CANCEL_EVENT.is_set():
+            _save_cache(pdf_dir, cache)  # giữ lại phần đã quét
+            raise CancelledByUser()
+
+    def scan_sequential(indices: list[int]) -> None:
+        for index in indices:
+            check_cancel()
+            path = pdfs[index]
+            progress("scan", done, total, f"Đang đọc {path.name}")
+            if on_scan:
+                on_scan(index + 1, total, path, "start", None)
+            try:
+                info = inspect_pdf(path)
+            except Exception as exc:
+                info = _error_info(path, exc)
+            finish(index, info)
+
+    if pending:
+        workers, threads = choose_worker_plan(len(pending))
+        if workers <= 1:
+            global OCR_THREADS
+            OCR_THREADS = os.cpu_count() or 2
+            scan_sequential(pending)
+        else:
+            try:
+                context = mp.get_context("spawn")
+                cpu_percent()  # mồi lần đo đầu (psutil trả 0.0 ở lần gọi đầu)
+                queue_left = list(pending)
+                in_flight = {}
+                limit = min(2, workers)   # bắt đầu nhẹ nhàng, rồi tăng dần nếu còn dư
+                with ProcessPoolExecutor(
+                    max_workers=workers,
+                    mp_context=context,
+                    initializer=_init_worker,
+                    initargs=(threads,),
+                ) as pool:
+                    while queue_left or in_flight:
+                        check_cancel()
+                        while queue_left and len(in_flight) < limit:
+                            index = queue_left.pop(0)
+                            if on_scan:
+                                on_scan(index + 1, total, pdfs[index], "start", None)
+                            in_flight[pool.submit(inspect_pdf, pdfs[index])] = index
+                        finished, _ = wait(
+                            in_flight, timeout=2, return_when=FIRST_COMPLETED
+                        )
+                        for future in finished:
+                            index = in_flight.pop(future)
+                            try:
+                                info = future.result()
+                            except BrokenProcessPool:
+                                raise
+                            except Exception as exc:
+                                info = _error_info(pdfs[index], exc)
+                            finish(index, info)
+                        limit = adapt_concurrency(limit, workers)
+            except BrokenProcessPool:
+                # Hết RAM hoặc tiến trình con bị chết: quét nốt các file còn lại tuần tự.
+                remaining = [i for i in pending if docs[i] is None]
+                OCR_THREADS = os.cpu_count() or 2
+                scan_sequential(remaining)
+
+    _save_cache(pdf_dir, cache)
+    return [doc for doc in docs if doc is not None]
+
+
 def process(
     excel_path: Path,
     pdf_dir: Path,
@@ -1146,15 +1513,7 @@ def process(
     pdfs = sorted(pdf_dir.rglob("*.pdf"))
     if not pdfs:
         raise ValueError("Thư mục đã chọn không có file PDF.")
-    docs = []
-    for i, path in enumerate(pdfs, 1):
-        progress("scan", i, len(pdfs), f"Đang đọc {path.name}")
-        if on_scan:
-            on_scan(i, len(pdfs), path, "start", None)
-        info = inspect_pdf(path)
-        docs.append(info)
-        if on_scan:
-            on_scan(i, len(pdfs), path, "done", info)
+    docs = scan_pdfs(pdfs, pdf_dir, progress, on_scan)
 
     filename_matches = assign_filename_similarity_matches(
         df, cols["name"], cols["id"], docs
@@ -1164,6 +1523,8 @@ def process(
     }
     results, used, confidently_used = [], set(), set()
     for i, (_, row) in enumerate(df.iterrows(), 1):
+        if CANCEL_EVENT.is_set():
+            raise CancelledByUser()
         progress("match", i, len(df), f"Đang đối chiếu dòng {i}")
         name = str(row.get(cols["name"], "") or "")
         cid = norm_digits(row.get(cols["id"], ""))
@@ -1308,6 +1669,7 @@ def process(
         if on_result:
             on_result(i, name, cid, result)
 
+    progress("export", 1, 1, "Đang xuất file kết quả Excel...")
     for idx, col in enumerate(OUTPUT_COLUMNS):
         df[col] = [r[idx] for r in results]
     unused = [d.path for d in docs if d.path not in used]
@@ -1356,278 +1718,1003 @@ def style_output(path: Path, name_column: str):
     wb.save(path)
 
 
+# =============================================================================
+# Giao diện
+# =============================================================================
+P = {
+    "bg": "#F3F6FA",
+    "card": "#FFFFFF",
+    "border": "#D9E1EC",
+    "primary": "#1F4E78",
+    "primary_hover": "#2A6AA3",
+    "text": "#1F2937",
+    "muted": "#6B7280",
+    "ok": "#C6EFCE", "ok_fg": "#1E6B34", "ok_row": "#EAF7EE",
+    "warn": "#FFF2CC", "warn_fg": "#8A6100", "warn_row": "#FFF9E3",
+    "bad": "#F4CCCC", "bad_fg": "#9B1C1C", "bad_row": "#FCE8E8",
+    "none": "#E2E5E9", "none_fg": "#4B5563", "none_row": "#F0F1F3",
+    "info_row": "#EAF2FB",
+}
+STATUS_ORDER = ["OK", "Cần kiểm tra", "Sai thông tin", "Không tìm thấy hồ sơ"]
+STATUS_TAG = {
+    "OK": "ok",
+    "Cần kiểm tra": "warn",
+    "Sai thông tin": "bad",
+    "Không tìm thấy hồ sơ": "none",
+}
+ALL_STATUS = "Tất cả"
+SETTINGS_FILE = CACHE_DIR / "settings.json"
+
+
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_settings(data: dict) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        SETTINGS_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def open_path(path) -> None:
+    target = str(Path(path).resolve())
+    if sys.platform == "win32":
+        os.startfile(target)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", target])
+    else:
+        subprocess.Popen(["xdg-open", target])
+
+
+def fmt_time(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
 class App(tk.Tk):
+    STEPS = [("scan", "1  Quét PDF"), ("match", "2  Đối chiếu"), ("export", "3  Xuất Excel")]
+
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("760x500")
-        self.minsize(680, 440)
-        self.excel = tk.StringVar()
-        self.folder = tk.StringVar()
-        self.output = tk.StringVar()
-        self.live_preview = tk.BooleanVar(value=True)
-        self.queue = Queue()
-        self.preview_window = None
-        self.preview_tree = None
-        self.scan_preview_tree = None
-        self.scan_preview_rows = {}
-        self.match_preview_rows = {}
+        self.configure(bg=P["bg"])
+        self.minsize(980, 680)
+        width, height = 1160, 820
+        x = max(0, (self.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.winfo_screenheight() - height) // 3)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+        saved = load_settings()
+        self.excel = tk.StringVar(value=saved.get("excel", ""))
+        self.folder = tk.StringVar(value=saved.get("folder", ""))
+        self.output = tk.StringVar(value=saved.get("output", ""))
+        self.use_cache = tk.BooleanVar(value=saved.get("cache", True))
+        self.status_filter = tk.StringVar(value=ALL_STATUS)
+        self.search_match = tk.StringVar()
+        self.search_scan = tk.StringVar()
+        self.status_var = tk.StringVar(value="Sẵn sàng. Chọn file Excel và thư mục PDF rồi bấm Bắt đầu.")
+        self.timing_var = tk.StringVar(value="")
+        self.scan_stats_var = tk.StringVar(value="")
+        self.match_count_var = tk.StringVar(value="")
+        self.scan_count_var = tk.StringVar(value="")
+
+        self.queue: Queue = Queue()
+        self.running = False
+        self.scan_rows: dict[str, tuple[tuple, str]] = {}
+        self.scan_paths: dict[str, str] = {}
+        self.match_rows: dict[str, tuple[tuple, str]] = {}
+        self.counts: Counter = Counter()
+        self.scan_stats: Counter = Counter()
+        self.phase: str | None = None
+        self.phase_t0: dict[str, float] = {}
+        self.run_t0 = 0.0
+        self.progress_n = 0
+        self.progress_total = 0
+        self.fraction = 0.0
+        self._timers: dict[str, str] = {}
+        self._titles: dict[tuple[int, str], str] = {}
+        self._sort_dir: dict[tuple[int, str], bool] = {}
+        self.input_widgets: list = []
+        self.tiles: dict[str, tk.Label] = {}
+
+        self._setup_style()
         self._build()
+        for var in (self.excel, self.folder):
+            var.trace_add("write", lambda *_: self._debounce("info", self._refresh_info, 500))
+        self.search_match.trace_add("write", lambda *_: self._debounce("fm", self._rebuild_match))
+        self.search_scan.trace_add("write", lambda *_: self._debounce("fs", self._rebuild_scan))
+        self._refresh_info()
+        self.bind_all("<Button-1>", self._on_global_click, add="+")
+        self.bind_class("TEntry", "<FocusOut>", lambda e: e.widget.selection_clear(), add="+")
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ------------------------------------------------------------------ style
+    def _setup_style(self):
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+            try:
+                tkfont.nametofont(name).configure(family="Segoe UI", size=10)
+            except tk.TclError:
+                pass
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        ui = "Segoe UI"
+
+        def fixed_map(option):
+            # Sửa lỗi Tk 8.6.9: tag màu của Treeview không hiển thị.
+            return [
+                entry for entry in style.map("Treeview", query_opt=option)
+                if entry[:2] != ("!disabled", "!selected")
+            ]
+
+        style.configure(".", background=P["bg"], foreground=P["text"], font=(ui, 10))
+        style.configure("TFrame", background=P["bg"])
+        style.configure("Card.TFrame", background=P["card"])
+        style.configure("TLabel", background=P["bg"])
+        style.configure("Card.TLabel", background=P["card"])
+        style.configure("Muted.TLabel", background=P["card"], foreground=P["muted"], font=(ui, 9))
+        style.configure("Good.TLabel", background=P["card"], foreground=P["ok_fg"], font=(ui, 9))
+        style.configure("Bad.TLabel", background=P["card"], foreground=P["bad_fg"], font=(ui, 9))
+        style.configure("Bar.TLabel", background=P["bg"], foreground=P["muted"], font=(ui, 9))
+        style.configure("TCheckbutton", background=P["bg"], focuscolor=P["bg"])
+        style.map("TCheckbutton", background=[("active", P["bg"])])
+        style.configure(
+            "TEntry", padding=7, fieldbackground="#FFFFFF", foreground=P["text"],
+            insertcolor="#000000", insertwidth=2,
+            selectbackground="#BBD6F0", selectforeground=P["text"],
+            bordercolor=P["border"], lightcolor=P["border"], darkcolor=P["border"],
+        )
+        style.map(
+            "TEntry",
+            bordercolor=[("focus", P["primary"])],
+            lightcolor=[("focus", P["primary"])],
+            darkcolor=[("focus", P["primary"])],
+        )
+        style.configure(
+            "TButton", padding=(14, 7), background="#FFFFFF", foreground=P["text"],
+            bordercolor=P["border"], lightcolor="#FFFFFF", darkcolor="#FFFFFF",
+            focuscolor="#FFFFFF",
+        )
+        style.map(
+            "TButton",
+            background=[("disabled", "#F3F4F6"), ("active", "#EAF1F8")],
+            foreground=[("disabled", "#9CA3AF")],
+        )
+        style.configure(
+            "Primary.TButton", font=(ui, 11, "bold"), padding=(28, 10),
+            background=P["primary"], foreground="#FFFFFF", bordercolor=P["primary"],
+            lightcolor=P["primary"], darkcolor=P["primary"], focuscolor=P["primary"],
+        )
+        style.map(
+            "Primary.TButton",
+            background=[("disabled", "#9DB3C8"), ("active", P["primary_hover"])],
+            foreground=[("disabled", "#FFFFFF")],
+        )
+        style.configure(
+            "Danger.TButton", font=(ui, 10, "bold"), padding=(18, 10),
+            background="#FFFFFF", foreground="#B42318", bordercolor="#F0B4AE",
+        )
+        style.map(
+            "Danger.TButton",
+            background=[("disabled", "#F3F4F6"), ("active", "#FDECEA")],
+            foreground=[("disabled", "#9CA3AF")],
+        )
+        style.configure(
+            "Accent.Horizontal.TProgressbar", troughcolor="#E5EAF1",
+            background=P["primary"], bordercolor="#E5EAF1",
+            lightcolor=P["primary"], darkcolor=P["primary"], thickness=16,
+        )
+        style.configure(
+            "Treeview", rowheight=27, background="#FFFFFF", fieldbackground="#FFFFFF",
+            borderwidth=0, font=(ui, 10),
+        )
+        style.configure(
+            "Treeview.Heading", font=(ui, 10, "bold"), background="#EEF2F7",
+            foreground=P["text"], padding=(8, 7), relief="flat",
+        )
+        style.map("Treeview.Heading", background=[("active", "#E1E8F0")])
+        style.map(
+            "Treeview",
+            foreground=fixed_map("foreground"),
+            background=[("selected", "focus", "#BBD6F0")] + fixed_map("background"),
+        )
+        style.configure("TNotebook", background=P["bg"], borderwidth=0)
+        style.configure(
+            "TNotebook.Tab", padding=(20, 9), font=(ui, 10, "bold"),
+            background="#E5EAF1", foreground=P["muted"],
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", "#FFFFFF")],
+            foreground=[("selected", P["primary"])],
+            focuscolor=[("selected", "#FFFFFF"), ("!selected", "#E5EAF1")],
+        )
+        style.configure("TCombobox", padding=5, insertcolor="#000000", insertwidth=2)
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", "#FFFFFF")],
+            selectbackground=[("readonly", "!focus", "#FFFFFF")],
+            selectforeground=[("readonly", "!focus", P["text"])],
+        )
+        style.configure("Vertical.TScrollbar", background="#E5EAF1", troughcolor=P["card"], bordercolor=P["card"])
+        style.configure("Horizontal.TScrollbar", background="#E5EAF1", troughcolor=P["card"], bordercolor=P["card"])
+
+    # ----------------------------------------------------------------- layout
+    def _card(self, parent) -> tk.Frame:
+        return tk.Frame(parent, bg=P["card"], highlightbackground=P["border"], highlightthickness=1)
 
     def _build(self):
-        root = ttk.Frame(self, padding=24)
-        root.pack(fill="both", expand=True)
-        ttk.Label(root, text="ĐỐI SOÁT HỒ SƠ", font=("Segoe UI", 19, "bold")).pack(anchor="w")
-        ttk.Label(root, text="Chọn danh sách Excel và thư mục PDF, sau đó bấm Bắt đầu kiểm tra.").pack(anchor="w", pady=(4, 22))
-        self._picker(root, "File Excel", self.excel, self.pick_excel)
-        self._picker(root, "Thư mục PDF", self.folder, self.pick_folder)
-        self._picker(root, "File kết quả", self.output, self.pick_output)
-        self.live_preview_check = ttk.Checkbutton(
-            root,
-            text="Hiển thị kết quả trực tiếp trong khi xử lý",
-            variable=self.live_preview,
-            command=self._toggle_live_preview,
-        )
-        self.live_preview_check.pack(anchor="w", pady=(8, 0))
-        self.start = ttk.Button(root, text="Bắt đầu kiểm tra", command=self.run)
-        self.start.pack(anchor="w", pady=(18, 12), ipadx=12, ipady=6)
-        self.bar = ttk.Progressbar(root, mode="determinate")
-        self.bar.pack(fill="x")
-        self.status = ttk.Label(root, text="Sẵn sàng", wraplength=700)
-        self.status.pack(anchor="w", pady=8)
-        self.summary = ttk.Label(root, text="", font=("Segoe UI", 11, "bold"))
-        self.summary.pack(anchor="w", pady=8)
+        header = tk.Frame(self, bg=P["primary"])
+        header.pack(fill="x")
+        left = tk.Frame(header, bg=P["primary"])
+        left.pack(side="left", padx=26, pady=14)
+        tk.Label(left, text="ĐỐI SOÁT HỒ SƠ", bg=P["primary"], fg="#FFFFFF",
+                 font=("Segoe UI", 19, "bold")).pack(anchor="w")
+        tk.Label(left, text="Tự động quét PDF, OCR tiếng Việt và đối chiếu với danh sách Excel",
+                 bg=P["primary"], fg="#C9DAEA", font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 0))
+        tk.Label(header, text="Quét song song  •  Có cache  •  Hủy bất cứ lúc nào",
+                 bg=P["primary"], fg="#9FB9D3", font=("Segoe UI", 9)).pack(side="right", padx=26)
 
-    def _picker(self, parent, label, variable, command):
-        frame = ttk.Frame(parent)
-        frame.pack(fill="x", pady=5)
-        ttk.Label(frame, text=label, width=14).pack(side="left")
-        ttk.Entry(frame, textvariable=variable).pack(side="left", fill="x", expand=True, padx=8)
-        ttk.Button(frame, text="Chọn...", command=command).pack(side="right")
+        body = ttk.Frame(self, padding=(22, 16, 22, 16))
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(4, weight=1)
+
+        self._build_inputs(body)
+        self._build_actions(body)
+        self._build_progress(body)
+        self._build_tiles(body)
+        self._build_results(body)
+
+    def _build_inputs(self, body):
+        card = self._card(body)
+        card.grid(row=0, column=0, sticky="ew")
+        inner = ttk.Frame(card, style="Card.TFrame", padding=(18, 12, 18, 12))
+        inner.pack(fill="x")
+        inner.columnconfigure(1, weight=1)
+        inner.columnconfigure(0, minsize=150)
+        specs = [
+            ("File Excel (danh sách)", self.excel, self.pick_excel, "excel_info"),
+            ("Thư mục PDF", self.folder, self.pick_folder, "folder_info"),
+            ("File kết quả", self.output, self.pick_output, None),
+        ]
+        for index, (label, variable, command, info_name) in enumerate(specs):
+            row = index * 2
+            ttk.Label(inner, text=label, style="Card.TLabel",
+                      font=("Segoe UI", 10, "bold")).grid(row=row, column=0, sticky="w", pady=(6, 0))
+            entry = ttk.Entry(inner, textvariable=variable)
+            entry.grid(row=row, column=1, sticky="ew", pady=(6, 0))
+            button = ttk.Button(inner, text="Chọn...", command=command)
+            button.grid(row=row, column=2, padx=(10, 0), pady=(6, 0))
+            self.input_widgets += [entry, button]
+            if info_name:
+                label_widget = ttk.Label(inner, text="", style="Muted.TLabel")
+                label_widget.grid(row=row + 1, column=1, sticky="w", pady=(2, 0))
+                setattr(self, info_name, label_widget)
+
+    def _build_actions(self, body):
+        bar = ttk.Frame(body)
+        bar.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        self.start = ttk.Button(bar, text="Bắt đầu kiểm tra", style="Primary.TButton", command=self.run)
+        self.start.pack(side="left")
+        self.cancel_btn = ttk.Button(bar, text="Hủy", style="Danger.TButton",
+                                     command=self.cancel, state="disabled")
+        self.cancel_btn.pack(side="left", padx=(10, 0))
+        self.cache_check = ttk.Checkbutton(bar, text="Dùng cache quét PDF", variable=self.use_cache)
+        self.cache_check.pack(side="left", padx=(26, 0))
+        self.clear_btn = ttk.Button(bar, text="Xóa cache", command=self.clear_cache)
+        self.clear_btn.pack(side="left", padx=(12, 0))
+        self.open_dir_btn = ttk.Button(bar, text="Mở thư mục", command=self.open_result_folder, state="disabled")
+        self.open_dir_btn.pack(side="right")
+        self.open_file_btn = ttk.Button(bar, text="Mở file kết quả", command=self.open_result_file, state="disabled")
+        self.open_file_btn.pack(side="right", padx=(0, 8))
+
+    def _build_progress(self, body):
+        card = self._card(body)
+        card.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+        inner = ttk.Frame(card, style="Card.TFrame", padding=(18, 12, 18, 12))
+        inner.pack(fill="x")
+        inner.columnconfigure(0, weight=1)
+
+        steps = ttk.Frame(inner, style="Card.TFrame")
+        steps.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.step_labels: dict[str, tk.Label] = {}
+        for index, (key, text) in enumerate(self.STEPS):
+            label = tk.Label(steps, text=text, bg=P["card"], fg=P["muted"], font=("Segoe UI", 10))
+            label.pack(side="left")
+            self.step_labels[key] = label
+            if index < len(self.STEPS) - 1:
+                tk.Label(steps, text="   ›   ", bg=P["card"], fg="#B8C2CF").pack(side="left")
+
+        self.bar = ttk.Progressbar(inner, style="Accent.Horizontal.TProgressbar",
+                                   mode="determinate", maximum=1000)
+        self.bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 8))
+        ttk.Label(inner, textvariable=self.status_var, style="Card.TLabel",
+                  wraplength=720).grid(row=2, column=0, sticky="w")
+        ttk.Label(inner, textvariable=self.timing_var, style="Card.TLabel",
+                  font=("Segoe UI", 10, "bold")).grid(row=2, column=1, sticky="e")
+        ttk.Label(inner, textvariable=self.scan_stats_var, style="Muted.TLabel").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+    def _build_tiles(self, body):
+        row = ttk.Frame(body)
+        row.grid(row=3, column=0, sticky="ew", pady=(14, 0))
+        specs = [
+            ("total", "Tổng số dòng", "#FFFFFF", P["text"]),
+            ("OK", "OK", P["ok"], P["ok_fg"]),
+            ("Cần kiểm tra", "Cần kiểm tra", P["warn"], P["warn_fg"]),
+            ("Sai thông tin", "Sai thông tin", P["bad"], P["bad_fg"]),
+            ("Không tìm thấy hồ sơ", "Không tìm thấy hồ sơ", P["none"], P["none_fg"]),
+        ]
+        for column, (key, title, background, foreground) in enumerate(specs):
+            row.columnconfigure(column, weight=1, uniform="tile")
+            tile = tk.Frame(row, bg=background, highlightbackground=P["border"],
+                            highlightthickness=1, cursor="hand2")
+            tile.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 8, 0))
+            number = tk.Label(tile, text="0", bg=background, fg=foreground,
+                              font=("Segoe UI", 22, "bold"), cursor="hand2")
+            number.pack(anchor="w", padx=14, pady=(8, 0))
+            caption = tk.Label(tile, text=title, bg=background, fg=foreground,
+                               font=("Segoe UI", 10), cursor="hand2")
+            caption.pack(anchor="w", padx=14, pady=(0, 8))
+            self.tiles[key] = number
+            for widget in (tile, number, caption):
+                widget.bind("<Button-1>", lambda _e, k=key: self._filter_by(k))
+
+    def _build_results(self, body):
+        wrap = ttk.Frame(body)
+        wrap.grid(row=4, column=0, sticky="nsew", pady=(14, 0))
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+        self.notebook = ttk.Notebook(wrap)
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+
+        match_tab = ttk.Frame(self.notebook, style="Card.TFrame", padding=10)
+        scan_tab = ttk.Frame(self.notebook, style="Card.TFrame", padding=10)
+        self.notebook.add(match_tab, text="Kết quả đối soát")
+        self.notebook.add(scan_tab, text="Quét PDF")
+
+        # --- tab đối soát
+        toolbar = ttk.Frame(match_tab, style="Card.TFrame")
+        toolbar.pack(fill="x", pady=(0, 8))
+        ttk.Label(toolbar, text="Tìm:", style="Card.TLabel").pack(side="left")
+        ttk.Entry(toolbar, textvariable=self.search_match, width=30).pack(side="left", padx=(6, 14))
+        ttk.Label(toolbar, text="Trạng thái:", style="Card.TLabel").pack(side="left")
+        combo = ttk.Combobox(toolbar, textvariable=self.status_filter, state="readonly", width=22,
+                             values=[ALL_STATUS, *STATUS_ORDER])
+        combo.pack(side="left", padx=(6, 14))
+        combo.bind("<<ComboboxSelected>>", lambda _e: (self._rebuild_match(), combo.selection_clear(), self.focus_set()))
+        ttk.Label(toolbar, textvariable=self.match_count_var, style="Muted.TLabel").pack(side="left")
+        ttk.Label(toolbar, text="Nhấp đúp để mở PDF  •  Nhấp phải để thêm tùy chọn  •  Nhấp tiêu đề cột để sắp xếp",
+                  style="Muted.TLabel").pack(side="right")
+        self.match_tree = self._make_tree(
+            match_tab,
+            {
+                "row": ("Dòng", 55, "e", False),
+                "name": ("Họ tên", 190, "w", False),
+                "cid": ("CCCD", 120, "w", False),
+                "status": ("Trạng thái", 135, "w", False),
+                "conf": ("OCR (%)", 70, "e", False),
+                "detail": ("Chi tiết", 360, "w", True),
+                "path": ("Tài liệu", 260, "w", True),
+            },
+        )
+
+        # --- tab quét PDF
+        toolbar = ttk.Frame(scan_tab, style="Card.TFrame")
+        toolbar.pack(fill="x", pady=(0, 8))
+        ttk.Label(toolbar, text="Tìm:", style="Card.TLabel").pack(side="left")
+        ttk.Entry(toolbar, textvariable=self.search_scan, width=30).pack(side="left", padx=(6, 14))
+        ttk.Label(toolbar, textvariable=self.scan_count_var, style="Muted.TLabel").pack(side="left")
+        self.scan_tree = self._make_tree(
+            scan_tab,
+            {
+                "scan": ("Lượt", 55, "e", False),
+                "pdf": ("PDF", 250, "w", False),
+                "status": ("Trạng thái quét", 125, "w", False),
+                "ids": ("CCCD/CMND", 130, "w", False),
+                "id_score": ("Điểm ID", 70, "e", False),
+                "dob": ("Ngày sinh", 100, "w", False),
+                "dob_score": ("Điểm NS", 70, "e", False),
+                "conf": ("OCR (%)", 70, "e", False),
+                "text": ("Văn bản trích xuất", 400, "w", True),
+            },
+        )
+
+    def _make_tree(self, parent, spec: dict) -> ttk.Treeview:
+        holder = ttk.Frame(parent, style="Card.TFrame")
+        holder.pack(fill="both", expand=True)
+        tree = ttk.Treeview(holder, columns=tuple(spec), show="headings", selectmode="browse")
+        for column, (title, width, anchor, stretch) in spec.items():
+            self._titles[(id(tree), column)] = title
+            tree.heading(column, text=title, command=lambda c=column, t=tree: self._sort(t, c))
+            tree.column(column, width=width, minwidth=50, anchor=anchor, stretch=stretch)
+        vertical = ttk.Scrollbar(holder, orient="vertical", command=tree.yview)
+        horizontal = ttk.Scrollbar(holder, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        holder.rowconfigure(0, weight=1)
+        holder.columnconfigure(0, weight=1)
+        for tag in ("ok", "warn", "bad", "none"):
+            tree.tag_configure(tag, background=P[f"{tag}_row"])
+        tree.tag_configure("ocr", background=P["info_row"])
+        tree.tag_configure("err", background=P["bad_row"], foreground=P["bad_fg"])
+        tree.bind(
+            "<Button-1>",
+            lambda e, t=tree: t.selection_remove(*t.selection()) if not t.identify_row(e.y) else None,
+            add="+",
+        )
+        tree.bind("<Double-1>", lambda _e, t=tree: self._open_selected(t))
+        tree.bind("<Button-3>", lambda e, t=tree: self._context_menu(e, t))
+        tree.bind("<Button-2>", lambda e, t=tree: self._context_menu(e, t))
+        return tree
+
+    # ------------------------------------------------------------ small utils
+    def _reset_widget_states(self):
+        """Bỏ trạng thái hover/nhấn còn kẹt của nút và đưa focus ra khỏi ô nhập."""
+        def walk(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, (ttk.Button, ttk.Checkbutton)):
+                    child.state(["!active", "!pressed"])
+                walk(child)
+
+        walk(self)
+        self.focus_set()
+
+    def _on_global_click(self, event):
+        widget = event.widget
+        if not isinstance(widget, tk.Misc):
+            return  # ví dụ: danh sách thả xuống của combobox
+        if not isinstance(widget, (ttk.Treeview, ttk.Scrollbar, tk.Menu)):
+            # Bấm ra ngoài bảng (kể cả vào nút, ô tìm kiếm...) -> bỏ chọn dòng.
+            for tree in (self.match_tree, self.scan_tree):
+                selected = tree.selection()
+                if selected:
+                    tree.selection_remove(*selected)
+        interactive = (ttk.Entry, ttk.Combobox, ttk.Treeview, ttk.Button, ttk.Checkbutton,
+                       ttk.Scrollbar, ttk.Notebook, tk.Menu, tk.Listbox, tk.Entry)
+        if isinstance(widget, interactive):
+            return
+        self._reset_widget_states()  # bấm vào chỗ trống: mọi thứ về trạng thái bình thường
+
+    def _debounce(self, key: str, func, delay: int = 250):
+        old = self._timers.get(key)
+        if old:
+            self.after_cancel(old)
+        self._timers[key] = self.after(delay, func)
+
+    def _save_settings(self):
+        save_settings({
+            "excel": self.excel.get(),
+            "folder": self.folder.get(),
+            "output": self.output.get(),
+            "cache": self.use_cache.get(),
+        })
+
+    # ----------------------------------------------------------------- inputs
+    def _refresh_info(self):
+        excel = self.excel.get().strip()
+        if not excel:
+            self.excel_info.config(text="", style="Muted.TLabel")
+        elif not Path(excel).is_file():
+            self.excel_info.config(text="Không tìm thấy file Excel này", style="Bad.TLabel")
+        else:
+            try:
+                header = pd.read_excel(excel, nrows=0, dtype=object)
+                cols = detect_columns(header.columns)
+                if cols["name"] and cols["id"]:
+                    text = f"Nhận diện cột:  Họ tên = “{cols['name']}”   •   CCCD = “{cols['id']}”"
+                    text += f"   •   Ngày sinh = “{cols['dob']}”" if cols["dob"] else "   •   (không có cột ngày sinh)"
+                    self.excel_info.config(text=text, style="Good.TLabel")
+                else:
+                    self.excel_info.config(
+                        text="Không nhận ra cột Họ tên/CCCD. Hãy đổi tiêu đề thành “Họ và tên” và “Số CCCD”.",
+                        style="Bad.TLabel",
+                    )
+            except Exception as exc:
+                self.excel_info.config(text=f"Không đọc được file Excel: {exc}", style="Bad.TLabel")
+
+        folder = self.folder.get().strip()
+        if not folder:
+            self.folder_info.config(text="", style="Muted.TLabel")
+        elif not Path(folder).is_dir():
+            self.folder_info.config(text="Không tìm thấy thư mục này", style="Bad.TLabel")
+        else:
+            self.folder_info.config(text="Đang đếm file PDF...", style="Muted.TLabel")
+
+            def count():
+                try:
+                    total = sum(1 for _ in Path(folder).rglob("*.pdf"))
+                except Exception:
+                    total = -1
+                try:
+                    self.after(0, lambda: self._show_pdf_count(folder, total))
+                except Exception:
+                    pass
+
+            threading.Thread(target=count, daemon=True).start()
+
+    def _show_pdf_count(self, folder: str, total: int):
+        if folder != self.folder.get().strip():
+            return
+        if total < 0:
+            self.folder_info.config(text="Không đọc được thư mục", style="Bad.TLabel")
+        elif total == 0:
+            self.folder_info.config(text="Thư mục không có file PDF nào", style="Bad.TLabel")
+        else:
+            self.folder_info.config(text=f"Tìm thấy {total:,} file PDF (gồm cả thư mục con)", style="Good.TLabel")
 
     def pick_excel(self):
-        p = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
-        if p:
-            self.excel.set(p)
-            self.output.set(str(Path(p).with_name(Path(p).stem + "_ket_qua.xlsx")))
+        path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
+        if path:
+            self.excel.set(path)
+            self.output.set(str(Path(path).with_name(Path(path).stem + "_ket_qua.xlsx")))
+        self._reset_widget_states()
 
     def pick_folder(self):
-        if p := filedialog.askdirectory():
-            self.folder.set(p)
+        if path := filedialog.askdirectory():
+            self.folder.set(path)
+        self._reset_widget_states()
 
     def pick_output(self):
-        if p := filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")]):
-            self.output.set(p)
+        if path := filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")]):
+            self.output.set(path)
+        self._reset_widget_states()
+
+    # ---------------------------------------------------------------- running
+    def _set_running(self, running: bool):
+        self.running = running
+        state = "disabled" if running else "normal"
+        self.start.config(state=state)
+        self.clear_btn.config(state=state)
+        self.cache_check.config(state=state)  # chỉ đọc một lần lúc bấm Bắt đầu
+        for widget in self.input_widgets:
+            widget.config(state=state)
+        self.cancel_btn.config(state="normal" if running else "disabled", text="Hủy")
+        if running:
+            self.open_file_btn.config(state="disabled")
+            self.open_dir_btn.config(state="disabled")
+
+    def _reset_results(self):
+        for tree in (self.match_tree, self.scan_tree):
+            tree.delete(*tree.get_children())
+        self.scan_rows.clear()
+        self.scan_paths.clear()
+        self.match_rows.clear()
+        self.counts.clear()
+        self.scan_stats.clear()
+        self.phase = None
+        self.phase_t0.clear()
+        self.progress_n = self.progress_total = 0
+        self.fraction = 0.0
+        self.bar.config(value=0)
+        self.status_filter.set(ALL_STATUS)
+        self.search_match.set("")
+        self.search_scan.set("")
+        self.scan_stats_var.set("")
+        self.timing_var.set("")
+        self.match_count_var.set("")
+        self.scan_count_var.set("")
+        self._update_tiles()
+        self._set_steps(None)
 
     def run(self):
-        if not self.excel.get() or not self.folder.get() or not self.output.get():
+        if self.running:
+            return
+        excel, folder, output = self.excel.get().strip(), self.folder.get().strip(), self.output.get().strip()
+        if not excel or not folder or not output:
             messagebox.showwarning(APP_NAME, "Vui lòng chọn đủ file Excel, thư mục PDF và file kết quả.")
             return
-        output_path = Path(self.output.get())
-        if output_path.resolve() == Path(self.excel.get()).resolve():
+        if not Path(excel).is_file():
+            messagebox.showerror(APP_NAME, "Không tìm thấy file Excel đã chọn.")
+            return
+        if not Path(folder).is_dir():
+            messagebox.showerror(APP_NAME, "Không tìm thấy thư mục PDF đã chọn.")
+            return
+        if Path(output).resolve() == Path(excel).resolve():
             messagebox.showerror(APP_NAME, "File kết quả không được trùng với file Excel nguồn.")
             return
-        output_path = confirm_output_path(output_path)
-        if output_path is None:
+        confirmed = confirm_output_path(Path(output))
+        if confirmed is None:
             return
-        self.output.set(str(output_path))
-        self._close_live_preview()
-        self.scan_preview_rows.clear()
-        self.match_preview_rows.clear()
-        self.start.config(state="disabled")
-        self.summary.config(text="")
-        if self.live_preview.get():
-            self._open_live_preview()
-        threading.Thread(target=self._worker, daemon=True).start()
+        self.output.set(str(confirmed))
+        self._save_settings()
+
+        global USE_CACHE
+        USE_CACHE = self.use_cache.get()
+        CANCEL_EVENT.clear()
+        self._reset_results()
+        self._set_running(True)
+        self.run_t0 = time.time()
+        self.status_var.set("Đang chuẩn bị...")
+        self.notebook.select(1)  # xem tiến độ quét PDF trước
+        threading.Thread(
+            target=self._worker, args=(Path(excel), Path(folder), confirmed), daemon=True
+        ).start()
         self.after(100, self._poll)
+        self.after(1000, self._tick)
 
-    def _toggle_live_preview(self):
-        if self.live_preview.get():
-            self._open_live_preview()
-        else:
-            self._close_live_preview()
-
-    def _close_live_preview(self):
-        window = self.preview_window
-        self.preview_window = None
-        self.preview_tree = None
-        self.scan_preview_tree = None
-        if window is not None and window.winfo_exists():
-            window.destroy()
-
-    @staticmethod
-    def _upsert_preview_row(tree, item_id, values):
-        if tree is None or not tree.winfo_exists():
+    def cancel(self):
+        if not self.running:
             return
-        if tree.exists(item_id):
-            tree.item(item_id, values=values)
-        else:
-            tree.insert("", "end", iid=item_id, values=values)
+        CANCEL_EVENT.set()
+        self.cancel_btn.config(state="disabled", text="Đang hủy...")
+        self.status_var.set("Đang hủy: chờ các PDF đang xử lý chạy xong (kết quả đã quét vẫn được lưu cache)...")
 
-    def _open_live_preview(self):
-        if self.preview_window is not None and self.preview_window.winfo_exists():
-            self.preview_window.lift()
-            return
-
-        window = tk.Toplevel(self)
-        window.title("Kết quả đối soát trực tiếp")
-        window.geometry("1100x440")
-        window.minsize(760, 280)
-        window.transient(self)
-        self.preview_window = window
-
-        frame = ttk.Frame(window, padding=12)
-        frame.pack(fill="both", expand=True)
-        header = ttk.Frame(frame)
-        header.pack(fill="x")
-        table_frame = ttk.Frame(frame)
-        table_frame.pack(fill="both", expand=True)
-        ttk.Label(
-            header,
-            text="PDF được hiển thị đúng thứ tự quét; kết quả đối soát Excel xuất hiện sau khi quét xong.",
-        ).pack(anchor="w", pady=(0, 8))
-        notebook = ttk.Notebook(table_frame)
-        notebook.pack(fill="both", expand=True)
-        scan_tab = ttk.Frame(notebook, padding=6)
-        match_tab = ttk.Frame(notebook, padding=6)
-        notebook.add(scan_tab, text="Quét PDF")
-        notebook.add(match_tab, text="Đối soát Excel")
-
-        def create_tree(parent, columns, headings):
-            tree = ttk.Treeview(parent, columns=columns, show="headings")
-            for column, (heading, width) in headings.items():
-                tree.heading(column, text=heading)
-                tree.column(
-                    column,
-                    width=width,
-                    minwidth=45,
-                    stretch=column in {"text", "detail", "path"},
-                )
-            vertical = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
-            horizontal = ttk.Scrollbar(parent, orient="horizontal", command=tree.xview)
-            tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-            tree.grid(row=0, column=0, sticky="nsew")
-            vertical.grid(row=0, column=1, sticky="ns")
-            horizontal.grid(row=1, column=0, sticky="ew")
-            parent.rowconfigure(0, weight=1)
-            parent.columnconfigure(0, weight=1)
-            return tree
-
-        scan_tree = create_tree(
-            scan_tab,
-            ("scan", "pdf", "status", "ids", "id_score", "dob", "dob_score", "confidence", "text"),
-            {
-                "scan": ("Lượt", 55),
-                "pdf": ("PDF", 240),
-                "status": ("Trạng thái quét", 120),
-                "ids": ("CCCD/CMND", 140),
-                "id_score": ("Điểm ID (%)", 85),
-                "dob": ("Ngày sinh", 110),
-                "dob_score": ("Điểm ngày sinh (%)", 115),
-                "confidence": ("OCR (%)", 75),
-                "text": ("Văn bản OCR / text trích xuất", 400),
-            },
-        )
-        match_tree = create_tree(
-            match_tab,
-            ("row", "name", "citizen_id", "status", "confidence", "detail", "path"),
-            {
-                "row": ("Dòng", 55),
-                "name": ("Họ tên", 150),
-                "citizen_id": ("CCCD", 115),
-                "status": ("Trạng thái", 130),
-                "confidence": ("OCR (%)", 75),
-                "detail": ("Chi tiết", 300),
-                "path": ("Tài liệu", 240),
-            },
-        )
-        self.preview_tree = match_tree
-        self.scan_preview_tree = scan_tree
-
-        for item_id, values in self.scan_preview_rows.items():
-            self._upsert_preview_row(scan_tree, item_id, values)
-        for item_id, values in self.match_preview_rows.items():
-            self._upsert_preview_row(match_tree, item_id, values)
-
-        def close_preview():
-            self.live_preview.set(False)
-            self._close_live_preview()
-
-        window.protocol("WM_DELETE_WINDOW", close_preview)
-
-    def _worker(self):
+    def _worker(self, excel: Path, folder: Path, output: Path):
+        put = self.queue.put
         try:
-            result = process(Path(self.excel.get()), Path(self.folder.get()), Path(self.output.get()),
-                             lambda phase, n, total, msg: self.queue.put(("progress", n, total, msg)),
-                             lambda row, name, cid, values: self.queue.put(
-                                 ("result", row, name, cid, *values)
-                             ),
-                             lambda n, total, path, phase, info: self.queue.put(
-                                 ("scan", n, total, path, phase, info)
-                             ))
-            self.queue.put(("done", result))
+            result = process(
+                excel, folder, output,
+                lambda phase, n, total, msg: put(("progress", phase, n, total, msg)),
+                lambda row, name, cid, values: put(("result", row, name, cid, *values)),
+                lambda n, total, path, phase, info: put(("scan", n, total, path, phase, info)),
+            )
+            put(("done", result))
+        except CancelledByUser:
+            put(("cancelled",))
         except Exception as exc:
-            self.queue.put(("error", str(exc)))
+            put(("error", str(exc)))
 
+    # ---------------------------------------------------------------- polling
     def _poll(self):
+        handled = 0
         try:
-            while True:
+            while handled < 300:
                 event = self.queue.get_nowait()
-                if event[0] == "progress":
-                    _, n, total, msg = event
-                    self.bar["maximum"], self.bar["value"] = total, n
-                    self.status.config(text=msg)
-                elif event[0] == "result":
-                    _, row, name, cid, status, detail, confidence, path, _ = event
-                    item_id = f"row-{row}"
-                    values = (row, name, cid, status, confidence, detail, path)
-                    self.match_preview_rows[item_id] = values
-                    self._upsert_preview_row(self.preview_tree, item_id, values)
-                elif event[0] == "scan":
-                    _, index, total, path, phase, info = event
-                    item_id = f"scan-{index}"
-                    if phase == "start":
-                        values = (index, path.name, "Đang quét...", "", "", "", "", "", "")
-                    else:
-                        status = "Lỗi đọc" if info.error else (
-                            "Đã OCR" if info.used_ocr else "Đã đọc text"
-                        )
-                        confidence = (
-                            round(info.confidence, 1)
-                            if info.confidence is not None
-                            else ""
-                        )
-                        values = (
-                            index,
-                            path.name,
-                            status,
-                            ", ".join(sorted(info.ids)),
-                            f"{info.id_confidence:.1f}" if info.id_confidence is not None else "",
-                            ", ".join(sorted(info.birth_dates)),
-                            f"{info.birth_date_confidence:.1f}"
-                            if info.birth_date_confidence is not None
-                            else "",
-                            confidence,
-                            info.text,
-                        )
-                    self.scan_preview_rows[item_id] = values
-                    self._upsert_preview_row(self.scan_preview_tree, item_id, values)
-                elif event[0] == "done":
-                    counts, pdf_count = event[1]
-                    text = " | ".join(f"{k}: {v}" for k, v in counts.items())
-                    self.summary.config(text=text)
-                    self.status.config(text=f"Hoàn tất {pdf_count} PDF")
-                    self.start.config(state="normal")
-                    if messagebox.askyesno(APP_NAME, "Đã xuất file kết quả. Mở thư mục chứa file?"):
-                        open_folder(Path(self.output.get()).parent)
-                    return
-                elif event[0] == "error":
-                    self.start.config(state="normal")
-                    messagebox.showerror(APP_NAME, event[1])
+                handled += 1
+                if self._handle(event) == "stop":
                     return
         except Empty:
-            self.after(100, self._poll)
+            pass
+        self.after(30 if handled >= 300 else 100, self._poll)
+
+    def _tick(self):
+        if not self.running:
+            return
+        self._update_timing()
+        self.notebook.tab(1, text=f"Quét PDF ({len(self.scan_rows)})")
+        self.after(1000, self._tick)
+
+    def _handle(self, event):
+        kind = event[0]
+        if kind == "progress":
+            _, phase, n, total, message = event
+            self._update_progress(phase, n, total, message)
+        elif kind == "scan":
+            self._on_scan(event)
+        elif kind == "result":
+            self._on_result(event)
+        elif kind == "done":
+            self._finish(event[1])
+            return "stop"
+        elif kind == "cancelled":
+            self._set_running(False)
+            self.status_var.set("Đã hủy. Phần PDF đã quét được lưu cache, lần chạy sau sẽ nhanh hơn.")
+            self.timing_var.set("")
+            return "stop"
+        elif kind == "error":
+            self._set_running(False)
+            self.status_var.set("Có lỗi xảy ra.")
+            messagebox.showerror(APP_NAME, event[1])
+            return "stop"
+        return None
+
+    def _update_progress(self, phase: str, n: int, total: int, message: str):
+        now = time.time()
+        if phase != self.phase:
+            self.phase = phase
+            self.phase_t0[phase] = now
+            self._set_steps(phase)
+            if phase == "match" and self.notebook.index("current") == 1:
+                self.notebook.select(0)  # chuyển sang bảng đối soát khi bắt đầu đối chiếu
+        self.progress_n, self.progress_total = n, total
+        ratio = n / total if total else 1.0
+        if phase == "scan":
+            self.fraction = 0.85 * ratio
+        elif phase == "match":
+            self.fraction = 0.85 + 0.13 * ratio
+        else:
+            self.fraction = 1.0
+        self.bar.config(value=self.fraction * 1000)
+        self.status_var.set(message)
+        self._update_timing()
+
+    def _update_timing(self):
+        elapsed = time.time() - self.run_t0
+        n, total = self.progress_n, self.progress_total
+        text = f"{self.fraction * 100:.0f}%   •   Đã chạy {fmt_time(elapsed)}"
+        if self.phase == "scan" and 2 <= n < total:
+            per_item = (time.time() - self.phase_t0.get("scan", self.run_t0)) / n
+            text += f"   •   Còn ~{fmt_time(per_item * (total - n))}"
+        self.timing_var.set(text)
+
+    def _set_steps(self, phase: str | None, all_done: bool = False):
+        keys = [key for key, _ in self.STEPS]
+        current = keys.index(phase) if phase in keys else -1
+        for index, (key, text) in enumerate(self.STEPS):
+            label = self.step_labels[key]
+            if all_done or index < current:
+                label.config(text="✔ " + text, fg=P["ok_fg"], font=("Segoe UI", 10))
+            elif index == current:
+                label.config(text=text, fg=P["primary"], font=("Segoe UI", 10, "bold"))
+            else:
+                label.config(text=text, fg=P["muted"], font=("Segoe UI", 10))
+
+    # ----------------------------------------------------------- scan / match
+    def _upsert(self, tree, item_id: str, values: tuple, tag: str):
+        if tree.exists(item_id):
+            tree.item(item_id, values=values, tags=(tag,) if tag else ())
+            return
+        at_bottom = tree.yview()[1] >= 0.97
+        tree.insert("", "end", iid=item_id, values=values, tags=(tag,) if tag else ())
+        if at_bottom:
+            tree.see(item_id)
+
+    def _on_scan(self, event):
+        _, index, _total, path, phase, info = event
+        item_id = f"scan-{index}"
+        self.scan_paths[item_id] = str(path)
+        if phase == "start":
+            values = (index, path.name, "Đang quét...", "", "", "", "", "", "")
+            tag = ""
+        else:
+            if info.error:
+                status, tag = "Lỗi đọc", "err"
+                self.scan_stats["err"] += 1
+            elif info.used_ocr:
+                status, tag = "Đã OCR", "ocr"
+                self.scan_stats["ocr"] += 1
+            else:
+                status, tag = "Đã đọc text", ""
+                self.scan_stats["text"] += 1
+            confidence = round(info.confidence, 1) if info.confidence is not None else ""
+            values = (
+                index,
+                path.name,
+                status,
+                ", ".join(sorted(info.ids)),
+                f"{info.id_confidence:.1f}" if info.id_confidence is not None else "",
+                ", ".join(sorted(info.birth_dates)),
+                f"{info.birth_date_confidence:.1f}" if info.birth_date_confidence is not None else "",
+                confidence,
+                " ".join(info.text[:300].split()),
+            )
+            self.scan_stats_var.set(
+                f"Đã quét:  {self.scan_stats['ocr']} OCR   •   {self.scan_stats['text']} đọc text   "
+                f"•   {self.scan_stats['err']} lỗi"
+            )
+        self.scan_rows[f"scan-{index}"] = (values, tag)
+        if self._scan_visible(values):
+            self._upsert(self.scan_tree, item_id, values, tag)
+
+    def _on_result(self, event):
+        _, row, name, cid, status, detail, confidence, path, _note = event
+        item_id = f"row-{row}"
+        values = (row, name, cid, status, confidence, detail, path)
+        tag = STATUS_TAG.get(status, "")
+        self.match_rows[item_id] = (values, tag)
+        self.counts[status] += 1
+        self._update_tiles()
+        if self._match_visible(values):
+            self._upsert(self.match_tree, item_id, values, tag)
+            self._update_match_counter(len(self.match_tree.get_children()))
+
+    def _update_tiles(self):
+        self.tiles["total"].config(text=f"{sum(self.counts.values()):,}")
+        for status in STATUS_ORDER:
+            self.tiles[status].config(text=f"{self.counts.get(status, 0):,}")
+
+    def _finish(self, result):
+        counts, pdf_count = result
+        self.counts = Counter(counts)
+        self._update_tiles()
+        self._set_running(False)
+        self.fraction = 1.0
+        self.bar.config(value=1000)
+        self._set_steps(None, all_done=True)
+        self._rebuild_match()
+        self._rebuild_scan()
+        self.notebook.tab(1, text=f"Quét PDF ({len(self.scan_rows)})")
+        self.notebook.select(0)
+        elapsed = time.time() - self.run_t0
+        self.status_var.set(f"Hoàn tất {pdf_count:,} PDF, {sum(counts.values()):,} dòng Excel. File đã lưu: {self.output.get()}")
+        self.timing_var.set(f"100%   •   Tổng thời gian {fmt_time(elapsed)}")
+        self.open_file_btn.config(state="normal")
+        self.open_dir_btn.config(state="normal")
+        self.bell()
+
+    # ------------------------------------------------------- filter and sort
+    def _match_visible(self, values: tuple) -> bool:
+        wanted = self.status_filter.get()
+        if wanted != ALL_STATUS and values[3] != wanted:
+            return False
+        query = norm_text(self.search_match.get())
+        if not query:
+            return True
+        haystack = norm_text(" ".join(str(values[i]) for i in (1, 2, 5, 6)))
+        return query in haystack
+
+    def _scan_visible(self, values: tuple) -> bool:
+        query = norm_text(self.search_scan.get())
+        if not query:
+            return True
+        return query in norm_text(" ".join(str(values[i]) for i in (1, 3, 5)))
+
+    def _update_match_counter(self, shown: int):
+        filtering = bool(self.search_match.get().strip()) or self.status_filter.get() != ALL_STATUS
+        self.match_count_var.set(
+            f"Đang lọc: hiển thị {shown}/{len(self.match_rows)} dòng" if filtering else ""
+        )
+
+    def _update_scan_counter(self, shown: int):
+        filtering = bool(self.search_scan.get().strip())
+        self.scan_count_var.set(
+            f"Đang lọc: hiển thị {shown}/{len(self.scan_rows)} PDF" if filtering else ""
+        )
+
+    def _rebuild_match(self):
+        tree = self.match_tree
+        tree.delete(*tree.get_children())
+        shown = 0
+        for item_id, (values, tag) in sorted(self.match_rows.items(), key=lambda kv: kv[1][0][0]):
+            if self._match_visible(values):
+                tree.insert("", "end", iid=item_id, values=values, tags=(tag,) if tag else ())
+                shown += 1
+        self._update_match_counter(shown)
+
+    def _rebuild_scan(self):
+        tree = self.scan_tree
+        tree.delete(*tree.get_children())
+        shown = 0
+        for item_id, (values, tag) in sorted(self.scan_rows.items(), key=lambda kv: kv[1][0][0]):
+            if self._scan_visible(values):
+                tree.insert("", "end", iid=item_id, values=values, tags=(tag,) if tag else ())
+                shown += 1
+        self._update_scan_counter(shown)
+
+    def _filter_by(self, key: str):
+        self.status_filter.set(ALL_STATUS if key == "total" else key)
+        self.notebook.select(0)
+        self._rebuild_match()
+
+    def _sort(self, tree, column: str):
+        key = (id(tree), column)
+        descending = not self._sort_dir.get(key, True)
+        self._sort_dir = {key: descending}
+
+        def sort_key(item_id):
+            raw = str(tree.set(item_id, column)).replace(",", "").strip()
+            try:
+                return (0, float(raw), "")
+            except ValueError:
+                return (1, 0.0, norm_text(raw))
+
+        items = sorted(tree.get_children(""), key=sort_key, reverse=descending)
+        for position, item_id in enumerate(items):
+            tree.move(item_id, "", position)
+        for (tree_id, col), title in self._titles.items():
+            if tree_id == id(tree):
+                arrow = (" ▼" if descending else " ▲") if col == column else ""
+                tree.heading(col, text=title + arrow)
+
+    # ---------------------------------------------- open / copy / context menu
+    def _path_for(self, tree, item_id: str) -> str:
+        if tree is self.match_tree:
+            return str(tree.set(item_id, "path"))
+        return self.scan_paths.get(item_id, "")
+
+    def _open_selected(self, tree):
+        selection = tree.selection()
+        if not selection:
+            return
+        path = self._path_for(tree, selection[0])
+        if not path:
+            messagebox.showinfo(APP_NAME, "Dòng này chưa có tài liệu PDF để mở.")
+            return
+        try:
+            open_path(path)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Không mở được file:\n{exc}")
+
+    def _context_menu(self, event, tree):
+        item_id = tree.identify_row(event.y)
+        if not item_id:
+            return
+        tree.selection_set(item_id)
+        path = self._path_for(tree, item_id)
+        menu = tk.Menu(self, tearoff=0)
+        state = "normal" if path else "disabled"
+        menu.add_command(label="Mở PDF", state=state, command=lambda: self._open_selected(tree))
+        menu.add_command(
+            label="Mở thư mục chứa PDF", state=state,
+            command=lambda: open_path(Path(path).parent),
+        )
+        menu.add_separator()
+        menu.add_command(label="Sao chép đường dẫn", state=state, command=lambda: self._copy(path))
+        cid_column = "cid" if tree is self.match_tree else "ids"
+        cid_value = str(tree.set(item_id, cid_column)).strip()
+        menu.add_command(
+            label="Sao chép CCCD",
+            state="normal" if cid_value else "disabled",  # PDF chưa quét xong thì chưa có CCCD
+            command=lambda: self._copy(cid_value),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _copy(self, text: str):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
+    def open_result_file(self):
+        try:
+            open_path(self.output.get())
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Không mở được file:\n{exc}")
+
+    def open_result_folder(self):
+        try:
+            open_folder(Path(self.output.get()).parent)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Không mở được thư mục:\n{exc}")
+
+    # ------------------------------------------------------------------ cache
+    def clear_cache(self):
+        files = list(CACHE_DIR.glob("scan_*.pkl")) if CACHE_DIR.exists() else []
+        if not files:
+            messagebox.showinfo(APP_NAME, "Cache đang trống, không có gì để xóa.")
+            return
+        size_mb = sum(f.stat().st_size for f in files) / 2**20
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Xóa {len(files)} file cache ({size_mb:.1f} MB)?\n"
+            "Lần quét tiếp theo sẽ phải OCR lại toàn bộ PDF.",
+        ):
+            return
+        failed = 0
+        for file in files:
+            try:
+                file.unlink()
+            except OSError:
+                failed += 1
+        messagebox.showinfo(
+            APP_NAME,
+            "Đã xóa cache." if not failed else f"Đã xóa cache, riêng {failed} file không xóa được.",
+        )
+
+    def _on_close(self):
+        if self.running:
+            if not messagebox.askyesno(APP_NAME, "Đang xử lý dở. Thoát ứng dụng bây giờ?"):
+                return
+            CANCEL_EVENT.set()
+        self._save_settings()
+        was_running = self.running
+        self.destroy()
+        if was_running:
+            os._exit(0)  # dừng luôn các tiến trình OCR con
 
 
 if __name__ == "__main__":
+    # Bắt buộc khi đóng gói PyInstaller trên Windows, nếu không mỗi tiến trình
+    # con sẽ mở thêm một cửa sổ ứng dụng.
+    mp.freeze_support()
+    if sys.platform == "win32":
+        try:  # chữ nét hơn trên màn hình độ phân giải cao
+            import ctypes
+
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
     App().mainloop()

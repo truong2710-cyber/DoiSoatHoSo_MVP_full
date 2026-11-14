@@ -13,6 +13,17 @@ ngày sinh rồi xuất Excel có trạng thái, chi tiết sai lệch và hyper
 4. Double-click `build_windows.bat`; bản portable nằm tại `dist\DoiSoatHoSo.exe`.
 5. Chỉ cần gửi file `.exe` này. Máy nhận không cần cài Python hay bộ OCR riêng.
 
+### Build bằng GitHub Actions
+
+Các model OCR bị loại khỏi Git nên cần tải chúng lên một GitHub Release của repository
+với tag `ocr-models-v1`, gồm đúng hai asset `det.onnx` và `vgg_seq2seq.pth` (lấy từ hai
+đường dẫn ở trên). Sau đó push code lên nhánh `main`, hoặc mở tab **Actions**, chọn
+**Build Windows EXE** rồi bấm **Run workflow**. Khi build thành công, tải
+`DoiSoatHoSo.exe` trong artifact `DoiSoatHoSo-windows-x64` của lần chạy đó.
+
+Để cài thư viện chạy app thủ công, dùng `python -m pip install -r requirements.txt`.
+File này bao gồm dependency của app và DeepDoc; `requirements-build.txt` bổ sung
+PyInstaller dành riêng cho bước đóng gói.
 Các file model bị loại khỏi Git theo `.gitignore`; cần đặt chúng ở đúng các đường dẫn trên
 trước khi chạy OCR hoặc build bản portable.
 
