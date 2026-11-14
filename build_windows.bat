@@ -29,7 +29,9 @@ python -m pip install -r requirements-build.txt
 if errorlevel 1 goto :error
 python -c "import torch, torchvision; print('Torch', torch.__version__, '- torchvision', torchvision.__version__)"
 if errorlevel 1 goto :error
-python -m PyInstaller --noconfirm --clean --onedir --windowed --name "DoiSoatHoSo" --paths "deepdoc_vietocr" --collect-all pymupdf --collect-all pdfplumber --collect-all pypdfium2 --collect-all torch --collect-all torchvision --collect-all onnxruntime --collect-all cv2 --collect-all vietocr --add-data "deepdoc_vietocr\conf\service_conf.yaml;conf" --add-data "deepdoc_vietocr\onnx\det.onnx;onnx" --add-data "deepdoc_vietocr\vietocr\weight\vgg_seq2seq.pth;vietocr\weight" app.py
+python -c "import sys; sys.path.insert(0, 'deepdoc_vietocr'); from module.ocr import OCR; OCR(); print('DeepDoc OCR import and model initialization: OK')"
+if errorlevel 1 goto :error
+python -m PyInstaller --noconfirm --clean --onedir --windowed --name "DoiSoatHoSo" --paths "deepdoc_vietocr" --hidden-import module.ocr --hidden-import module.recognizer --hidden-import module.layout_recognizer --hidden-import module.table_structure_recognizer --collect-all pymupdf --collect-all pdfplumber --collect-all pypdfium2 --collect-all torch --collect-all torchvision --collect-all onnxruntime --collect-all cv2 --collect-all vietocr --add-data "deepdoc_vietocr\conf\service_conf.yaml;conf" --add-data "deepdoc_vietocr\onnx\det.onnx;onnx" --add-data "deepdoc_vietocr\vietocr\weight\vgg_seq2seq.pth;vietocr\weight" app.py
 if errorlevel 1 goto :error
 echo.
 echo Da tao ban portable: dist\DoiSoatHoSo\DoiSoatHoSo.exe

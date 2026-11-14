@@ -220,7 +220,8 @@ def get_deepdoc_ocr():
                     from module.ocr import OCR
                 except ModuleNotFoundError as exc:
                     raise RuntimeError(
-                        "Thiếu thư viện DeepDoc OCR. Hãy cài các gói trong requirements.txt."
+                        f"Thiếu module Python '{exc.name}' khi nạp DeepDoc OCR. "
+                        "Hãy kiểm tra bộ cài và các gói trong requirements.txt."
                     ) from exc
                 engine = OCR()
                 # Giới hạn số luồng PyTorch để nhiều tiến trình không tranh CPU nhau.
