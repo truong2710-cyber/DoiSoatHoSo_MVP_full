@@ -27,7 +27,9 @@ python -m pip install --upgrade pip
 if errorlevel 1 goto :error
 python -m pip install -r requirements-build.txt
 if errorlevel 1 goto :error
-python -m PyInstaller --noconfirm --clean --onedir --windowed --name "DoiSoatHoSo" --paths "deepdoc_vietocr" --collect-all pymupdf --collect-all pdfplumber --collect-all pypdfium2 --collect-all torch --collect-all onnxruntime --collect-all cv2 --collect-all vietocr --add-data "deepdoc_vietocr\conf\service_conf.yaml;conf" --add-data "deepdoc_vietocr\onnx\det.onnx;onnx" --add-data "deepdoc_vietocr\vietocr\weight\vgg_seq2seq.pth;vietocr\weight" app.py
+python -c "import torch, torchvision; print('Torch', torch.__version__, '- torchvision', torchvision.__version__)"
+if errorlevel 1 goto :error
+python -m PyInstaller --noconfirm --clean --onedir --windowed --name "DoiSoatHoSo" --paths "deepdoc_vietocr" --collect-all pymupdf --collect-all pdfplumber --collect-all pypdfium2 --collect-all torch --collect-all torchvision --collect-all onnxruntime --collect-all cv2 --collect-all vietocr --add-data "deepdoc_vietocr\conf\service_conf.yaml;conf" --add-data "deepdoc_vietocr\onnx\det.onnx;onnx" --add-data "deepdoc_vietocr\vietocr\weight\vgg_seq2seq.pth;vietocr\weight" app.py
 if errorlevel 1 goto :error
 echo.
 echo Da tao ban portable: dist\DoiSoatHoSo\DoiSoatHoSo.exe

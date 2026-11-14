@@ -30,3 +30,5 @@ deepdoc_vietocr/ocr_outputs/
 # Local/editor files
 .DS_Store
 .vscode/
+
+testcase/
