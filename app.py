@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import unicodedata
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
@@ -24,6 +25,13 @@ from queue import Empty, Queue
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
+
+# PyInstaller's windowed mode leaves standard streams unset. Some OCR and
+# numerical libraries still write diagnostics to them.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 import fitz  # PyMuPDF: dùng cho cả đọc text lẫn render ảnh (đã bỏ pdfplumber)
 import numpy as np
@@ -2365,7 +2373,24 @@ class App(tk.Tk):
         except CancelledByUser:
             put(("cancelled",))
         except Exception as exc:
-            put(("error", str(exc)))
+            error_log = CACHE_DIR / "errors.log"
+            try:
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                with error_log.open("a", encoding="utf-8") as log_file:
+                    log_file.write(
+                        f"\n{'=' * 80}\n{datetime.now().isoformat()}\n"
+                        f"{traceback.format_exc()}"
+                    )
+            except OSError as log_error:
+                put((
+                    "error",
+                    f"{exc}\n\nKhông lưu được traceback: {log_error}",
+                ))
+            else:
+                put((
+                    "error",
+                    f"{exc}\n\nTraceback đầy đủ đã lưu tại:\n{error_log}",
+                ))
 
     # ---------------------------------------------------------------- polling
     def _poll(self):
