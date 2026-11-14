@@ -10,16 +10,19 @@ ngày sinh rồi xuất Excel có trạng thái, chi tiết sai lệch và hyper
 3. Đảm bảo có hai model DeepDoc tại:
    `deepdoc_vietocr\onnx\det.onnx` và
    `deepdoc_vietocr\vietocr\weight\vgg_seq2seq.pth`.
-4. Double-click `build_windows.bat`; bản portable nằm tại `dist\DoiSoatHoSo.exe`.
-5. Chỉ cần gửi file `.exe` này. Máy nhận không cần cài Python hay bộ OCR riêng.
+4. Double-click `build_windows.bat`; bản portable nằm trong `dist\DoiSoatHoSo\`.
+5. Gửi toàn bộ thư mục `DoiSoatHoSo` cho máy nhận, không gửi riêng file `.exe`.
+   Chạy `DoiSoatHoSo.exe` bên trong thư mục đó; máy nhận không cần cài Python
+   hay bộ OCR riêng.
 
 ### Build bằng GitHub Actions
 
 Hai model OCR cần được commit tại các đường dẫn ở trên; workflow sẽ kiểm tra hash model,
-build Windows EXE khi push lên nhánh `main`, rồi đăng EXE thành artifact trong tab
+build Windows app khi push lên nhánh `main`, rồi đăng toàn bộ thư mục portable thành artifact trong tab
 **Actions**. Có thể chạy thủ công bằng cách mở **Actions**, chọn **Build Windows EXE**
-và bấm **Run workflow**. Tải `DoiSoatHoSo.exe` trong artifact
-`DoiSoatHoSo-windows-x64` của lần chạy thành công.
+và bấm **Run workflow**. Tải rồi giải nén artifact
+`DoiSoatHoSo-windows-x64-onedir` của lần chạy thành công; chạy EXE bên trong
+thư mục đã giải nén, giữ các file đi kèm cùng thư mục.
 
 Để cài thư viện chạy app thủ công, dùng `python -m pip install -r requirements.txt`.
 File này bao gồm dependency của app và DeepDoc; `requirements-build.txt` bổ sung
