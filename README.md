@@ -37,6 +37,16 @@ Bản `.exe` portable sẽ lớn hơn và lần mở đầu có thể chậm và
 giải nén engine OCR và model vào thư mục tạm. Windows SmartScreen cũng có thể cảnh báo vì
 file chưa được ký số; chỉ chọn **More info - Run anyway** khi nhận file từ nguồn tin cậy.
 
+## Bản Tesseract thử nghiệm
+
+`app_tesseract.py` giữ nguyên giao diện, nhận dạng thông tin và quy tắc đối soát của
+`app.py`, nhưng thay OCR DeepDoc + VietOCR bằng Tesseract. Cài Tesseract OCR có dữ liệu
+tiếng Việt (`vie.traineddata`), sau đó chạy `python app_tesseract.py`. Nếu lệnh
+`tesseract` không có trong `PATH`, đặt biến môi trường `TESSERACT_CMD` thành đường dẫn
+đến chương trình Tesseract. Bản này tự dùng thêm tiếng Anh nếu có `eng.traineddata`.
+Các điểm OCR của Tesseract không được hiệu chuẩn như điểm VietOCR; cần đánh giá kết quả
+thực tế trước khi dùng thay cho bản hiện tại.
+
 ## Định dạng Excel đầu vào
 
 Hàng đầu tiên là tiêu đề. App tự nhận các tên cột thường gặp, nhưng ổn định nhất là:
