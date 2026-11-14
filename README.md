@@ -15,11 +15,11 @@ ngày sinh rồi xuất Excel có trạng thái, chi tiết sai lệch và hyper
 
 ### Build bằng GitHub Actions
 
-Các model OCR bị loại khỏi Git nên cần tải chúng lên một GitHub Release của repository
-với tag `ocr-models-v1`, gồm đúng hai asset `det.onnx` và `vgg_seq2seq.pth` (lấy từ hai
-đường dẫn ở trên). Sau đó push code lên nhánh `main`, hoặc mở tab **Actions**, chọn
-**Build Windows EXE** rồi bấm **Run workflow**. Khi build thành công, tải
-`DoiSoatHoSo.exe` trong artifact `DoiSoatHoSo-windows-x64` của lần chạy đó.
+Hai model OCR cần được commit tại các đường dẫn ở trên; workflow sẽ kiểm tra hash model,
+build Windows EXE khi push lên nhánh `main`, rồi đăng EXE thành artifact trong tab
+**Actions**. Có thể chạy thủ công bằng cách mở **Actions**, chọn **Build Windows EXE**
+và bấm **Run workflow**. Tải `DoiSoatHoSo.exe` trong artifact
+`DoiSoatHoSo-windows-x64` của lần chạy thành công.
 
 Để cài thư viện chạy app thủ công, dùng `python -m pip install -r requirements.txt`.
 File này bao gồm dependency của app và DeepDoc; `requirements-build.txt` bổ sung

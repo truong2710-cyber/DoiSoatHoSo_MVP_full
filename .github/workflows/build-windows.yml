@@ -24,18 +24,13 @@ jobs:
           python-version: "3.12"
           architecture: x64
 
-      - name: Download OCR model assets
+      - name: Verify OCR model assets
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          New-Item -ItemType Directory -Force -Path model-assets | Out-Null
-          gh release download ocr-models-v1 --repo $env:GITHUB_REPOSITORY --dir model-assets
-
-          $detector = "model-assets/det.onnx"
-          $recognizer = "model-assets/vgg_seq2seq.pth"
+          $detector = "deepdoc_vietocr/onnx/det.onnx"
+          $recognizer = "deepdoc_vietocr/vietocr/weight/vgg_seq2seq.pth"
           if (!(Test-Path $detector) -or !(Test-Path $recognizer)) {
-            throw "Release ocr-models-v1 must contain det.onnx and vgg_seq2seq.pth."
+            throw "Commit det.onnx and vgg_seq2seq.pth at the expected DeepDoc paths."
           }
 
           $detectorHash = (Get-FileHash $detector -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -47,11 +42,6 @@ jobs:
           if ($recognizerHash -ne "efcabaa6d3adfca8e52bda2fd7d2ee04") {
             throw "vgg_seq2seq.pth failed MD5 verification."
           }
-
-          New-Item -ItemType Directory -Force -Path deepdoc_vietocr/onnx | Out-Null
-          New-Item -ItemType Directory -Force -Path deepdoc_vietocr/vietocr/weight | Out-Null
-          Copy-Item $detector deepdoc_vietocr/onnx/det.onnx
-          Copy-Item $recognizer deepdoc_vietocr/vietocr/weight/vgg_seq2seq.pth
 
       - name: Build executable
         shell: cmd
