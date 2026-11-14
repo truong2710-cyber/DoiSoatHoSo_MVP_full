@@ -1365,9 +1365,13 @@ class App(tk.Tk):
         self.excel = tk.StringVar()
         self.folder = tk.StringVar()
         self.output = tk.StringVar()
+        self.live_preview = tk.BooleanVar(value=True)
         self.queue = Queue()
         self.preview_window = None
         self.preview_tree = None
+        self.scan_preview_tree = None
+        self.scan_preview_rows = {}
+        self.match_preview_rows = {}
         self._build()
 
     def _build(self):
@@ -1378,6 +1382,13 @@ class App(tk.Tk):
         self._picker(root, "File Excel", self.excel, self.pick_excel)
         self._picker(root, "Thư mục PDF", self.folder, self.pick_folder)
         self._picker(root, "File kết quả", self.output, self.pick_output)
+        self.live_preview_check = ttk.Checkbutton(
+            root,
+            text="Hiển thị kết quả trực tiếp trong khi xử lý",
+            variable=self.live_preview,
+            command=self._toggle_live_preview,
+        )
+        self.live_preview_check.pack(anchor="w", pady=(8, 0))
         self.start = ttk.Button(root, text="Bắt đầu kiểm tra", command=self.run)
         self.start.pack(anchor="w", pady=(18, 12), ipadx=12, ipady=6)
         self.bar = ttk.Progressbar(root, mode="determinate")
@@ -1420,15 +1431,43 @@ class App(tk.Tk):
         if output_path is None:
             return
         self.output.set(str(output_path))
+        self._close_live_preview()
+        self.scan_preview_rows.clear()
+        self.match_preview_rows.clear()
         self.start.config(state="disabled")
         self.summary.config(text="")
-        self._open_live_preview()
+        if self.live_preview.get():
+            self._open_live_preview()
         threading.Thread(target=self._worker, daemon=True).start()
         self.after(100, self._poll)
 
+    def _toggle_live_preview(self):
+        if self.live_preview.get():
+            self._open_live_preview()
+        else:
+            self._close_live_preview()
+
+    def _close_live_preview(self):
+        window = self.preview_window
+        self.preview_window = None
+        self.preview_tree = None
+        self.scan_preview_tree = None
+        if window is not None and window.winfo_exists():
+            window.destroy()
+
+    @staticmethod
+    def _upsert_preview_row(tree, item_id, values):
+        if tree is None or not tree.winfo_exists():
+            return
+        if tree.exists(item_id):
+            tree.item(item_id, values=values)
+        else:
+            tree.insert("", "end", iid=item_id, values=values)
+
     def _open_live_preview(self):
         if self.preview_window is not None and self.preview_window.winfo_exists():
-            self.preview_window.destroy()
+            self.preview_window.lift()
+            return
 
         window = tk.Toplevel(self)
         window.title("Kết quả đối soát trực tiếp")
@@ -1505,11 +1544,14 @@ class App(tk.Tk):
         self.preview_tree = match_tree
         self.scan_preview_tree = scan_tree
 
+        for item_id, values in self.scan_preview_rows.items():
+            self._upsert_preview_row(scan_tree, item_id, values)
+        for item_id, values in self.match_preview_rows.items():
+            self._upsert_preview_row(match_tree, item_id, values)
+
         def close_preview():
-            self.preview_window = None
-            self.preview_tree = None
-            self.scan_preview_tree = None
-            window.destroy()
+            self.live_preview.set(False)
+            self._close_live_preview()
 
         window.protocol("WM_DELETE_WINDOW", close_preview)
 
@@ -1537,45 +1579,39 @@ class App(tk.Tk):
                     self.status.config(text=msg)
                 elif event[0] == "result":
                     _, row, name, cid, status, detail, confidence, path, _ = event
-                    if self.preview_tree is not None and self.preview_tree.winfo_exists():
-                        item_id = f"row-{row}"
-                        values = (row, name, cid, status, confidence, detail, path)
-                        if self.preview_tree.exists(item_id):
-                            self.preview_tree.item(item_id, values=values)
-                        else:
-                            self.preview_tree.insert("", "end", iid=item_id, values=values)
+                    item_id = f"row-{row}"
+                    values = (row, name, cid, status, confidence, detail, path)
+                    self.match_preview_rows[item_id] = values
+                    self._upsert_preview_row(self.preview_tree, item_id, values)
                 elif event[0] == "scan":
                     _, index, total, path, phase, info = event
-                    if self.scan_preview_tree is not None and self.scan_preview_tree.winfo_exists():
-                        item_id = f"scan-{index}"
-                        if phase == "start":
-                            values = (index, path.name, "Đang quét...", "", "", "", "", "", "")
-                        else:
-                            status = "Lỗi đọc" if info.error else (
-                                "Đã OCR" if info.used_ocr else "Đã đọc text"
-                            )
-                            confidence = (
-                                round(info.confidence, 1)
-                                if info.confidence is not None
-                                else ""
-                            )
-                            values = (
-                                index,
-                                path.name,
-                                status,
-                                ", ".join(sorted(info.ids)),
-                                f"{info.id_confidence:.1f}" if info.id_confidence is not None else "",
-                                ", ".join(sorted(info.birth_dates)),
-                                f"{info.birth_date_confidence:.1f}"
-                                if info.birth_date_confidence is not None
-                                else "",
-                                confidence,
-                                info.text,
-                            )
-                        if self.scan_preview_tree.exists(item_id):
-                            self.scan_preview_tree.item(item_id, values=values)
-                        else:
-                            self.scan_preview_tree.insert("", "end", iid=item_id, values=values)
+                    item_id = f"scan-{index}"
+                    if phase == "start":
+                        values = (index, path.name, "Đang quét...", "", "", "", "", "", "")
+                    else:
+                        status = "Lỗi đọc" if info.error else (
+                            "Đã OCR" if info.used_ocr else "Đã đọc text"
+                        )
+                        confidence = (
+                            round(info.confidence, 1)
+                            if info.confidence is not None
+                            else ""
+                        )
+                        values = (
+                            index,
+                            path.name,
+                            status,
+                            ", ".join(sorted(info.ids)),
+                            f"{info.id_confidence:.1f}" if info.id_confidence is not None else "",
+                            ", ".join(sorted(info.birth_dates)),
+                            f"{info.birth_date_confidence:.1f}"
+                            if info.birth_date_confidence is not None
+                            else "",
+                            confidence,
+                            info.text,
+                        )
+                    self.scan_preview_rows[item_id] = values
+                    self._upsert_preview_row(self.scan_preview_tree, item_id, values)
                 elif event[0] == "done":
                     counts, pdf_count = event[1]
                     text = " | ".join(f"{k}: {v}" for k, v in counts.items())

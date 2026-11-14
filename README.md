@@ -19,6 +19,10 @@ trước khi chạy OCR hoặc build bản portable.
 Nếu trước đó đã chạy bằng phiên bản Python khác và thư mục `.venv` đã tồn tại,
 hãy xóa riêng thư mục `.venv` trong thư mục app rồi chạy lại file `.bat`.
 
+Trên cửa sổ chính, bật/tắt **Hiển thị kết quả trực tiếp trong khi xử lý** bất cứ lúc nào
+để ẩn hoặc mở lại bảng tiến trình và kết quả. Khi mở lại, các dòng đã quét/đối soát vẫn
+được giữ lại. Tùy chọn này mặc định được bật.
+
 ## OCR cho PDF scan
 
 - App dùng DeepDoc để phát hiện dòng chữ và VietOCR để nhận dạng tiếng Việt trên CPU.
