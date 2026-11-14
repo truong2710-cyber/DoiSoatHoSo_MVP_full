@@ -14,7 +14,7 @@ if not exist .venv\Scripts\python.exe (
   call .venv\Scripts\activate.bat
   python -m pip install --upgrade pip
   if errorlevel 1 goto :error
-  python -m pip install --only-binary=:all: -r requirements.txt
+  python -m pip install -r requirements.txt
   if errorlevel 1 goto :error
 ) else (
   call .venv\Scripts\activate.bat
