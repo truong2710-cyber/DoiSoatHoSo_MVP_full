@@ -26,6 +26,7 @@ from app import (
     match_document,
     norm_date,
     norm_text,
+    open_excel_workbook,
     ocr_page,
     process,
     select_id_candidate,
@@ -42,6 +43,23 @@ def test_normalization():
     assert alternate_norm_date(datetime(2000, 6, 10)) == "06/10/2000"
     assert ids_match("145892756", "145892756")
     assert ids_match("12345678", "012345678")
+
+
+def test_excel_reader_engine_is_selected_by_extension():
+    with patch("app.pd.ExcelFile") as excel_file:
+        open_excel_workbook(Path("list.xls"))
+        excel_file.assert_called_once_with(Path("list.xls"), engine="xlrd")
+
+    with patch("app.pd.ExcelFile") as excel_file:
+        open_excel_workbook(Path("list.XLSX"))
+        excel_file.assert_called_once_with(Path("list.XLSX"), engine="openpyxl")
+
+    try:
+        open_excel_workbook(Path("list.xlsm"))
+    except ValueError as exc:
+        assert str(exc) == "Chỉ hỗ trợ file Excel .xls và .xlsx."
+    else:
+        raise AssertionError("Unsupported Excel extensions should be rejected")
 
 
 def test_ocr_page_reads_deepdoc_result_text_and_score():
@@ -1159,6 +1177,7 @@ def test_ocr_confidence_is_written_to_results():
 
 if __name__ == "__main__":
     test_normalization()
+    test_excel_reader_engine_is_selected_by_extension()
     test_ocr_page_reads_deepdoc_result_text_and_score()
     test_ocr_page_rotates_image_and_maps_boxes_back_to_page_coordinates()
     test_ocr_birth_date_parser_prefers_slashes_and_uses_id_year_when_malformed()

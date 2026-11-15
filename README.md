@@ -72,7 +72,8 @@ Hàng đầu tiên của mỗi sheet cần đối chiếu phải là tiêu đề
 
 Ứng dụng nhận diện một số biến thể tiêu đề phổ biến. Cột họ tên và CCCD là bắt buộc;
 cột ngày sinh có thể để trống hoặc không có. Nên lưu CCCD ở dạng văn bản để giữ số `0`
-ở đầu. File `.xls` và `.xlsx` được hỗ trợ làm đầu vào; kết quả luôn xuất thành `.xlsx`.
+ở đầu. File `.xls` được đọc bằng `xlrd`, file `.xlsx` bằng `openpyxl`; `.xlsb` và các
+định dạng khác không được hỗ trợ. Kết quả luôn xuất thành `.xlsx`.
 
 ## Chọn sheet và cách đối chiếu
 

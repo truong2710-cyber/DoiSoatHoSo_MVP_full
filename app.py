@@ -1528,6 +1528,15 @@ def scan_pdfs(pdfs: list[Path], pdf_dir: Path, progress, on_scan) -> list[Docume
     return [doc for doc in docs if doc is not None]
 
 
+def open_excel_workbook(excel_path: Path):
+    extension = Path(excel_path).suffix.lower()
+    engines = {".xls": "xlrd", ".xlsx": "openpyxl"}
+    engine = engines.get(extension)
+    if engine is None:
+        raise ValueError("Chỉ hỗ trợ file Excel .xls và .xlsx.")
+    return pd.ExcelFile(excel_path, engine=engine)
+
+
 def load_sheets(excel_path: Path, sheet: str | None):
     """Đọc các sheet cần đối soát.
 
@@ -1537,7 +1546,7 @@ def load_sheets(excel_path: Path, sheet: str | None):
     Chế độ một sheet: thiếu cột thì báo lỗi như trước.
     Chế độ "Tất cả các sheet": sheet không dùng được sẽ bị bỏ qua và ghi rõ lý do.
     """
-    with pd.ExcelFile(excel_path) as workbook:
+    with open_excel_workbook(excel_path) as workbook:
         names = list(workbook.sheet_names)
         if not names:
             raise ValueError("File Excel không có sheet nào.")
@@ -2422,7 +2431,7 @@ class App(tk.Tk):
             error = "Không tìm thấy file Excel này"
         elif excel:
             try:
-                with pd.ExcelFile(excel) as workbook:
+                with open_excel_workbook(Path(excel)) as workbook:
                     names = list(workbook.sheet_names)
                     for name in names:
                         try:
