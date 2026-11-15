@@ -51,6 +51,10 @@ OUTPUT_COLUMNS = [
     "Trạng thái đối soát", "Chi tiết sai lệch", "Độ tin cậy OCR",
     "Đường dẫn tài liệu", "Ghi chú kiểm tra thủ công",
 ]
+ALL_SHEETS = "Tất cả các sheet"
+SUMMARY_TITLE = "Tổng hợp sheet"
+UNMATCHED_TITLE = "PDF chưa ghép"
+SINGLE_RESULT_TITLE = "Kết quả đối soát"
 
 # ----------------------------------------------------------------------------
 # Cấu hình tốc độ (chỉnh ở đây)
@@ -1507,23 +1511,71 @@ def scan_pdfs(pdfs: list[Path], pdf_dir: Path, progress, on_scan) -> list[Docume
     return [doc for doc in docs if doc is not None]
 
 
-def process(
-    excel_path: Path,
-    pdf_dir: Path,
-    output_path: Path,
-    progress,
-    on_result=None,
-    on_scan=None,
-):
-    df = pd.read_excel(excel_path, dtype=object)
-    cols = detect_columns(df.columns)
-    if not cols["name"] or not cols["id"]:
-        raise ValueError("Không tự nhận ra cột Họ tên/CCCD. Hãy đổi tiêu đề cột thành 'Họ và tên' và 'Số CCCD'.")
-    pdfs = sorted(pdf_dir.rglob("*.pdf"))
-    if not pdfs:
-        raise ValueError("Thư mục đã chọn không có file PDF.")
-    docs = scan_pdfs(pdfs, pdf_dir, progress, on_scan)
+def load_sheets(excel_path: Path, sheet: str | None):
+    """Đọc các sheet cần đối soát.
 
+    Trả về (usable, skipped):
+      usable  = [(tên sheet, DataFrame, cột nhận diện)]
+      skipped = [(tên sheet, lý do, số dòng)]
+    Chế độ một sheet: thiếu cột thì báo lỗi như trước.
+    Chế độ "Tất cả các sheet": sheet không dùng được sẽ bị bỏ qua và ghi rõ lý do.
+    """
+    with pd.ExcelFile(excel_path) as workbook:
+        names = list(workbook.sheet_names)
+        if not names:
+            raise ValueError("File Excel không có sheet nào.")
+        if sheet == ALL_SHEETS:
+            chosen = names
+        elif not sheet:
+            chosen = names[:1]
+        elif sheet in names:
+            chosen = [sheet]
+        else:
+            raise ValueError(f"Không tìm thấy sheet “{sheet}” trong file Excel.")
+        usable, skipped = [], []
+        for name in chosen:
+            df = workbook.parse(name, dtype=object)
+            cols = detect_columns(df.columns)
+            missing = [
+                label for label, key in (("Họ tên", "name"), ("CCCD", "id")) if not cols[key]
+            ]
+            if missing:
+                reason = "Không tìm thấy cột " + " và ".join(missing)
+            elif df.empty:
+                reason = "Sheet không có dòng dữ liệu"
+            else:
+                usable.append((name, df, cols))
+                continue
+            skipped.append((name, reason, len(df)))
+    if sheet != ALL_SHEETS and skipped:
+        if skipped[0][1].startswith("Không tìm thấy cột"):
+            raise ValueError("Không tự nhận ra cột Họ tên/CCCD. Hãy đổi tiêu đề cột thành 'Họ và tên' và 'Số CCCD'.")
+        raise ValueError(f"Sheet “{skipped[0][0]}”: {skipped[0][1]}.")
+    if not usable:
+        details = "\n".join(f"• {name}: {reason}" for name, reason, _ in skipped)
+        raise ValueError("Không có sheet nào dùng được để đối soát:\n" + details)
+    return usable, skipped
+
+
+def safe_sheet_title(text) -> str:
+    cleaned = re.sub(r"[\[\]:*?/\\]", "_", str(text)).strip().strip("'")
+    return cleaned or "Sheet"
+
+
+def unique_sheet_title(base: str, used_titles: set[str]) -> str:
+    base = safe_sheet_title(base)[:31]
+    lowered = {title.lower() for title in used_titles}
+    title, number = base, 2
+    while title.lower() in lowered:
+        suffix = f" ({number})"
+        title = base[: 31 - len(suffix)] + suffix
+        number += 1
+    used_titles.add(title)
+    return title
+
+
+def reconcile_sheet(sheet_name, df, cols, docs, tick, on_result):
+    """Đối chiếu một sheet với danh sách PDF. Mỗi sheet ghép độc lập với nhau."""
     filename_matches = assign_filename_similarity_matches(
         df, cols["name"], cols["id"], docs
     )
@@ -1534,7 +1586,7 @@ def process(
     for i, (_, row) in enumerate(df.iterrows(), 1):
         if CANCEL_EVENT.is_set():
             raise CancelledByUser()
-        progress("match", i, len(df), f"Đang đối chiếu dòng {i}")
+        tick(sheet_name, i)
         name = str(row.get(cols["name"], "") or "")
         cid = norm_digits(row.get(cols["id"], ""))
         raw_dob = row.get(cols["dob"], "") if cols["dob"] else ""
@@ -1566,7 +1618,7 @@ def process(
             result = ["Không tìm thấy hồ sơ", "Không tìm thấy PDF khớp CCCD hoặc họ tên", "", "", ""]
             results.append(result)
             if on_result:
-                on_result(i, name, cid, result)
+                on_result(i, name, cid, result, sheet_name)
             continue
         used.add(doc.path)
         if score >= 0.8:
@@ -1676,54 +1728,143 @@ def process(
         result = [status, detail, confidence, str(doc.path.resolve()), ""]
         results.append(result)
         if on_result:
-            on_result(i, name, cid, result)
+            on_result(i, name, cid, result, sheet_name)
+
+    return results, used
+
+
+def process(
+    excel_path: Path,
+    pdf_dir: Path,
+    output_path: Path,
+    progress,
+    on_result=None,
+    on_scan=None,
+    sheet: str | None = None,
+):
+    usable, skipped = load_sheets(excel_path, sheet)
+    pdfs = sorted(pdf_dir.rglob("*.pdf"))
+    if not pdfs:
+        raise ValueError("Thư mục đã chọn không có file PDF.")
+    docs = scan_pdfs(pdfs, pdf_dir, progress, on_scan)
+
+    multi = sheet == ALL_SHEETS
+    total_rows = sum(len(df) for _, df, _ in usable)
+    done_rows = 0
+
+    def tick(sheet_name, row_number):
+        nonlocal done_rows
+        done_rows += 1
+        where = f"sheet “{sheet_name}”, " if multi else ""
+        progress("match", done_rows, total_rows, f"Đang đối chiếu {where}dòng {row_number}")
+
+    used: set[Path] = set()
+    counts: Counter = Counter()
+    used_titles = {SUMMARY_TITLE, UNMATCHED_TITLE}
+    outputs = []      # (tiêu đề sheet kết quả, DataFrame, tên cột họ tên)
+    summary_rows = []
+    for name, df, cols in usable:
+        results, sheet_used = reconcile_sheet(name, df, cols, docs, tick, on_result)
+        used |= sheet_used
+        result_df = df.copy()
+        for idx, col in enumerate(OUTPUT_COLUMNS):
+            result_df[col] = [r[idx] for r in results]
+        sheet_counts = result_df["Trạng thái đối soát"].value_counts().to_dict()
+        counts.update(sheet_counts)
+        if multi:
+            title = unique_sheet_title(f"{safe_sheet_title(name)[:18]} - kết quả", used_titles)
+        else:
+            title = SINGLE_RESULT_TITLE
+        outputs.append((title, result_df, cols["name"]))
+        summary_rows.append([
+            name, "Đã đối soát", len(df),
+            *[sheet_counts.get(status, 0) for status in STATUS_ORDER_NAMES],
+            f"Kết quả ở sheet “{title}”",
+        ])
+    for name, reason, row_count in skipped:
+        summary_rows.append([name, "Bỏ qua", row_count, "", "", "", "", reason])
 
     progress("export", 1, 1, "Đang xuất file kết quả Excel...")
-    for idx, col in enumerate(OUTPUT_COLUMNS):
-        df[col] = [r[idx] for r in results]
     unused = [d.path for d in docs if d.path not in used]
     if unused:
         print("PDF không khớp dòng Excel:")
         for path in unused:
             print(path.name)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Kết quả đối soát")
+        if multi:
+            pd.DataFrame(
+                summary_rows,
+                columns=["Sheet", "Kết quả", "Số dòng", *STATUS_ORDER_NAMES, "Ghi chú"],
+            ).to_excel(writer, index=False, sheet_name=SUMMARY_TITLE)
+        for title, result_df, _ in outputs:
+            result_df.to_excel(writer, index=False, sheet_name=title)
         pd.DataFrame({"PDF không khớp dòng Excel": [str(path.resolve()) for path in unused]}).to_excel(
-            writer, index=False, sheet_name="PDF chưa ghép"
+            writer, index=False, sheet_name=UNMATCHED_TITLE
         )
-    style_output(output_path, cols["name"])
-    counts = df["Trạng thái đối soát"].value_counts().to_dict()
-    return counts, len(pdfs)
+    note = (
+        f"Lưu ý: PDF thuộc các sheet bị bỏ qua sẽ xuất hiện trong sheet “{UNMATCHED_TITLE}”."
+        if skipped else ""
+    )
+    style_output(
+        output_path,
+        [(title, name_column) for title, _, name_column in outputs],
+        summary_title=SUMMARY_TITLE if multi else None,
+        summary_note=note,
+    )
+    return dict(counts), len(pdfs), skipped
 
 
-def style_output(path: Path, name_column: str):
-    wb = load_workbook(path)
-    ws = wb["Kết quả đối soát"]
-    headers = {cell.value: cell.column for cell in ws[1]}
-    fills = {
-        "OK": "C6EFCE", "Cần kiểm tra": "FFF2CC",
-        "Sai thông tin": "F4CCCC", "Không tìm thấy hồ sơ": "D9D9D9",
-    }
+STATUS_ORDER_NAMES = ["OK", "Cần kiểm tra", "Sai thông tin", "Không tìm thấy hồ sơ"]
+
+
+def _autosize_columns(ws):
+    for col_cells in ws.columns:
+        width = min(55, max(12, max(len(str(c.value or "")) for c in col_cells) + 2))
+        ws.column_dimensions[get_column_letter(col_cells[0].column)].width = width
+
+
+def _style_header_row(ws):
     for cell in ws[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="1F4E78")
         cell.alignment = Alignment(wrap_text=True)
-    status_col = headers["Trạng thái đối soát"]
-    link_col = headers["Đường dẫn tài liệu"]
-    name_col = headers.get(name_column)
-    for row in range(2, ws.max_row + 1):
-        status = ws.cell(row, status_col).value
-        ws.cell(row, status_col).fill = PatternFill("solid", fgColor=fills.get(status, "FFFFFF"))
-        link = ws.cell(row, link_col).value
-        if link:
-            target = ws.cell(row, name_col) if name_col else ws.cell(row, link_col)
-            target.hyperlink = Path(link).as_uri()
-            target.font = Font(color="0563C1", underline="single")
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    for col_cells in ws.columns:
-        width = min(55, max(12, max(len(str(c.value or "")) for c in col_cells) + 2))
-        ws.column_dimensions[get_column_letter(col_cells[0].column)].width = width
+
+
+def style_output(path: Path, targets, summary_title: str | None = None, summary_note: str = ""):
+    wb = load_workbook(path)
+    fills = {
+        "OK": "C6EFCE", "Cần kiểm tra": "FFF2CC",
+        "Sai thông tin": "F4CCCC", "Không tìm thấy hồ sơ": "D9D9D9",
+    }
+    for title, name_column in targets:
+        ws = wb[title]
+        headers = {cell.value: cell.column for cell in ws[1]}
+        _style_header_row(ws)
+        status_col = headers["Trạng thái đối soát"]
+        link_col = headers["Đường dẫn tài liệu"]
+        name_col = headers.get(name_column)
+        for row in range(2, ws.max_row + 1):
+            status = ws.cell(row, status_col).value
+            ws.cell(row, status_col).fill = PatternFill("solid", fgColor=fills.get(status, "FFFFFF"))
+            link = ws.cell(row, link_col).value
+            if link:
+                target = ws.cell(row, name_col) if name_col else ws.cell(row, link_col)
+                target.hyperlink = Path(link).as_uri()
+                target.font = Font(color="0563C1", underline="single")
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        _autosize_columns(ws)
+    if summary_title and summary_title in wb.sheetnames:
+        ws = wb[summary_title]
+        _style_header_row(ws)
+        for row in range(2, ws.max_row + 1):
+            if ws.cell(row, 2).value == "Bỏ qua":
+                for col in range(1, ws.max_column + 1):
+                    ws.cell(row, col).fill = PatternFill("solid", fgColor="FFF2CC")
+        ws.freeze_panes = "A2"
+        _autosize_columns(ws)
+        if summary_note:
+            ws.cell(ws.max_row + 2, 1, summary_note)
     wb.save(path)
 
 
@@ -1807,6 +1948,10 @@ class App(tk.Tk):
         self.folder = tk.StringVar(value=saved.get("folder", ""))
         self.output = tk.StringVar(value=saved.get("output", ""))
         self.use_cache = tk.BooleanVar(value=saved.get("cache", True))
+        self.sheet = tk.StringVar(value=saved.get("sheet", ""))
+        self.sheet_names: list[str] = []
+        self.sheet_cols: dict[str, dict | None] = {}
+        self.sheet_order: dict[str, int] = {}
         self.status_filter = tk.StringVar(value=ALL_STATUS)
         self.search_match = tk.StringVar()
         self.search_scan = tk.StringVar()
@@ -1990,24 +2135,34 @@ class App(tk.Tk):
         inner.pack(fill="x")
         inner.columnconfigure(1, weight=1)
         inner.columnconfigure(0, minsize=150)
-        specs = [
-            ("File Excel (danh sách)", self.excel, self.pick_excel, "excel_info"),
-            ("Thư mục PDF", self.folder, self.pick_folder, "folder_info"),
-            ("File kết quả", self.output, self.pick_output, None),
-        ]
-        for index, (label, variable, command, info_name) in enumerate(specs):
-            row = index * 2
-            ttk.Label(inner, text=label, style="Card.TLabel",
+
+        def label(row, text):
+            ttk.Label(inner, text=text, style="Card.TLabel",
                       font=("Segoe UI", 10, "bold")).grid(row=row, column=0, sticky="w", pady=(6, 0))
+
+        def picker(row, text, variable, command):
+            label(row, text)
             entry = ttk.Entry(inner, textvariable=variable)
             entry.grid(row=row, column=1, sticky="ew", pady=(6, 0))
             button = ttk.Button(inner, text="Chọn...", command=command)
             button.grid(row=row, column=2, padx=(10, 0), pady=(6, 0))
             self.input_widgets += [entry, button]
-            if info_name:
-                label_widget = ttk.Label(inner, text="", style="Muted.TLabel")
-                label_widget.grid(row=row + 1, column=1, sticky="w", pady=(2, 0))
-                setattr(self, info_name, label_widget)
+
+        def info(row):
+            widget = ttk.Label(inner, text="", style="Muted.TLabel", wraplength=780, justify="left")
+            widget.grid(row=row, column=1, sticky="w", pady=(2, 0))
+            return widget
+
+        picker(0, "File Excel (danh sách)", self.excel, self.pick_excel)
+        label(1, "Sheet cần đối soát")
+        self.sheet_combo = ttk.Combobox(inner, textvariable=self.sheet, state="readonly", width=44)
+        self.sheet_combo.grid(row=1, column=1, sticky="w", pady=(6, 0))
+        self.sheet_combo.bind("<<ComboboxSelected>>", self._on_sheet_selected)
+        self.input_widgets.append(self.sheet_combo)
+        self.excel_info = info(2)
+        picker(3, "Thư mục PDF", self.folder, self.pick_folder)
+        self.folder_info = info(4)
+        picker(5, "File kết quả", self.output, self.pick_output)
 
     def _build_actions(self, body):
         bar = ttk.Frame(body)
@@ -2108,6 +2263,7 @@ class App(tk.Tk):
             match_tab,
             {
                 "row": ("Dòng", 55, "e", False),
+                "sheet": ("Sheet", 120, "w", False),
                 "name": ("Họ tên", 190, "w", False),
                 "cid": ("CCCD", 120, "w", False),
                 "status": ("Trạng thái", 135, "w", False),
@@ -2208,30 +2364,12 @@ class App(tk.Tk):
             "folder": self.folder.get(),
             "output": self.output.get(),
             "cache": self.use_cache.get(),
+            "sheet": self.sheet.get(),
         })
 
     # ----------------------------------------------------------------- inputs
     def _refresh_info(self):
-        excel = self.excel.get().strip()
-        if not excel:
-            self.excel_info.config(text="", style="Muted.TLabel")
-        elif not Path(excel).is_file():
-            self.excel_info.config(text="Không tìm thấy file Excel này", style="Bad.TLabel")
-        else:
-            try:
-                header = pd.read_excel(excel, nrows=0, dtype=object)
-                cols = detect_columns(header.columns)
-                if cols["name"] and cols["id"]:
-                    text = f"Nhận diện cột:  Họ tên = “{cols['name']}”   •   CCCD = “{cols['id']}”"
-                    text += f"   •   Ngày sinh = “{cols['dob']}”" if cols["dob"] else "   •   (không có cột ngày sinh)"
-                    self.excel_info.config(text=text, style="Good.TLabel")
-                else:
-                    self.excel_info.config(
-                        text="Không nhận ra cột Họ tên/CCCD. Hãy đổi tiêu đề thành “Họ và tên” và “Số CCCD”.",
-                        style="Bad.TLabel",
-                    )
-            except Exception as exc:
-                self.excel_info.config(text=f"Không đọc được file Excel: {exc}", style="Bad.TLabel")
+        self._refresh_excel_info(self.excel.get().strip())
 
         folder = self.folder.get().strip()
         if not folder:
@@ -2253,6 +2391,73 @@ class App(tk.Tk):
 
             threading.Thread(target=count, daemon=True).start()
 
+    @staticmethod
+    def _missing_columns(cols) -> list[str]:
+        if cols is None:
+            return ["không đọc được sheet"]
+        return [label for label, key in (("Họ tên", "name"), ("CCCD", "id")) if not cols[key]]
+
+    def _refresh_excel_info(self, excel: str):
+        self.sheet_cols = {}
+        names: list[str] = []
+        error = ""
+        if excel and not Path(excel).is_file():
+            error = "Không tìm thấy file Excel này"
+        elif excel:
+            try:
+                with pd.ExcelFile(excel) as workbook:
+                    names = list(workbook.sheet_names)
+                    for name in names:
+                        try:
+                            header = workbook.parse(name, nrows=0, dtype=object)
+                            self.sheet_cols[name] = detect_columns(header.columns)
+                        except Exception:
+                            self.sheet_cols[name] = None
+            except Exception as exc:
+                error = f"Không đọc được file Excel: {exc}"
+        self.sheet_names = names
+        values = names + ([ALL_SHEETS] if len(names) > 1 else [])
+        self.sheet_combo.config(values=values)
+        if self.sheet.get() not in values:
+            self.sheet.set(names[0] if names else "")
+        if error:
+            self.excel_info.config(text=error, style="Bad.TLabel")
+        else:
+            self._update_sheet_info()
+
+    def _update_sheet_info(self):
+        names = self.sheet_names
+        if not names:
+            self.excel_info.config(text="", style="Muted.TLabel")
+            return
+        selected = self.sheet.get()
+        if selected == ALL_SHEETS:
+            usable = [n for n in names if not self._missing_columns(self.sheet_cols.get(n))]
+            skipped = [
+                f"{n} (thiếu {' và '.join(self._missing_columns(self.sheet_cols.get(n)))})"
+                for n in names if self._missing_columns(self.sheet_cols.get(n))
+            ]
+            text = f"Sẽ đối soát {len(usable)}/{len(names)} sheet"
+            if skipped:
+                text += "   •   Bỏ qua: " + "; ".join(skipped)
+            self.excel_info.config(text=text, style="Good.TLabel" if usable else "Bad.TLabel")
+            return
+        cols = self.sheet_cols.get(selected)
+        if cols and cols["name"] and cols["id"]:
+            text = f"Nhận diện cột:  Họ tên = “{cols['name']}”   •   CCCD = “{cols['id']}”"
+            text += f"   •   Ngày sinh = “{cols['dob']}”" if cols["dob"] else "   •   (không có cột ngày sinh)"
+            self.excel_info.config(text=text, style="Good.TLabel")
+        else:
+            self.excel_info.config(
+                text="Không nhận ra cột Họ tên/CCCD trong sheet này. Hãy đổi tiêu đề thành “Họ và tên” và “Số CCCD”.",
+                style="Bad.TLabel",
+            )
+
+    def _on_sheet_selected(self, _event=None):
+        self._update_sheet_info()
+        self.sheet_combo.selection_clear()
+        self.focus_set()
+
     def _show_pdf_count(self, folder: str, total: int):
         if folder != self.folder.get().strip():
             return
@@ -2266,6 +2471,7 @@ class App(tk.Tk):
     def pick_excel(self):
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
         if path:
+            self.sheet.set("")
             self.excel.set(path)
             self.output.set(str(Path(path).with_name(Path(path).stem + "_ket_qua.xlsx")))
         self._reset_widget_states()
@@ -2288,7 +2494,10 @@ class App(tk.Tk):
         self.clear_btn.config(state=state)
         self.cache_check.config(state=state)  # chỉ đọc một lần lúc bấm Bắt đầu
         for widget in self.input_widgets:
-            widget.config(state=state)
+            if isinstance(widget, ttk.Combobox):
+                widget.config(state="disabled" if running else "readonly")
+            else:
+                widget.config(state=state)
         self.cancel_btn.config(state="normal" if running else "disabled", text="Hủy")
         if running:
             self.open_file_btn.config(state="disabled")
@@ -2300,6 +2509,8 @@ class App(tk.Tk):
         self.scan_rows.clear()
         self.scan_paths.clear()
         self.match_rows.clear()
+        self.sheet_order.clear()
+        self._update_sheet_column()
         self.counts.clear()
         self.scan_stats.clear()
         self.phase = None
@@ -2348,7 +2559,9 @@ class App(tk.Tk):
         self.status_var.set("Đang chuẩn bị...")
         self.notebook.select(1)  # xem tiến độ quét PDF trước
         threading.Thread(
-            target=self._worker, args=(Path(excel), Path(folder), confirmed), daemon=True
+            target=self._worker,
+            args=(Path(excel), Path(folder), confirmed, self.sheet.get() or None),
+            daemon=True,
         ).start()
         self.after(100, self._poll)
         self.after(1000, self._tick)
@@ -2360,14 +2573,17 @@ class App(tk.Tk):
         self.cancel_btn.config(state="disabled", text="Đang hủy...")
         self.status_var.set("Đang hủy: chờ các PDF đang xử lý chạy xong (kết quả đã quét vẫn được lưu cache)...")
 
-    def _worker(self, excel: Path, folder: Path, output: Path):
+    def _worker(self, excel: Path, folder: Path, output: Path, sheet: str | None):
         put = self.queue.put
         try:
             result = process(
                 excel, folder, output,
                 lambda phase, n, total, msg: put(("progress", phase, n, total, msg)),
-                lambda row, name, cid, values: put(("result", row, name, cid, *values)),
+                lambda row, name, cid, values, sheet_name: put(
+                    ("result", sheet_name, row, name, cid, *values)
+                ),
                 lambda n, total, path, phase, info: put(("scan", n, total, path, phase, info)),
+                sheet=sheet,
             )
             put(("done", result))
         except CancelledByUser:
@@ -2525,9 +2741,12 @@ class App(tk.Tk):
             self._upsert(self.scan_tree, item_id, values, tag)
 
     def _on_result(self, event):
-        _, row, name, cid, status, detail, confidence, path, _note = event
-        item_id = f"row-{row}"
-        values = (row, name, cid, status, confidence, detail, path)
+        _, sheet_name, row, name, cid, status, detail, confidence, path, _note = event
+        if sheet_name not in self.sheet_order:
+            self.sheet_order[sheet_name] = len(self.sheet_order)
+            self._update_sheet_column()
+        item_id = f"row-{self.sheet_order[sheet_name]}-{row}"
+        values = (row, sheet_name, name, cid, status, confidence, detail, path)
         tag = STATUS_TAG.get(status, "")
         self.match_rows[item_id] = (values, tag)
         self.counts[status] += 1
@@ -2536,13 +2755,19 @@ class App(tk.Tk):
             self._upsert(self.match_tree, item_id, values, tag)
             self._update_match_counter(len(self.match_tree.get_children()))
 
+    def _update_sheet_column(self):
+        """Chỉ hiện cột Sheet khi kết quả đến từ nhiều hơn một sheet."""
+        columns = list(self.match_tree["columns"])
+        visible = columns if len(self.sheet_order) > 1 else [c for c in columns if c != "sheet"]
+        self.match_tree.configure(displaycolumns=visible)
+
     def _update_tiles(self):
         self.tiles["total"].config(text=f"{sum(self.counts.values()):,}")
         for status in STATUS_ORDER:
             self.tiles[status].config(text=f"{self.counts.get(status, 0):,}")
 
     def _finish(self, result):
-        counts, pdf_count = result
+        counts, pdf_count, skipped = result
         self.counts = Counter(counts)
         self._update_tiles()
         self._set_running(False)
@@ -2554,21 +2779,28 @@ class App(tk.Tk):
         self.notebook.tab(1, text=f"Quét PDF ({len(self.scan_rows)})")
         self.notebook.select(0)
         elapsed = time.time() - self.run_t0
-        self.status_var.set(f"Hoàn tất {pdf_count:,} PDF, {sum(counts.values()):,} dòng Excel. File đã lưu: {self.output.get()}")
+        skipped_note = f" Bỏ qua {len(skipped)} sheet." if skipped else ""
+        self.status_var.set(
+            f"Hoàn tất {pdf_count:,} PDF, {sum(counts.values()):,} dòng Excel.{skipped_note} "
+            f"File đã lưu: {self.output.get()}"
+        )
         self.timing_var.set(f"100%   •   Tổng thời gian {fmt_time(elapsed)}")
         self.open_file_btn.config(state="normal")
         self.open_dir_btn.config(state="normal")
         self.bell()
+        if skipped:
+            lines = "\n".join(f"• {name}: {reason}" for name, reason, _ in skipped)
+            messagebox.showinfo(APP_NAME, "Các sheet sau đã bị bỏ qua (không đối soát):\n\n" + lines)
 
     # ------------------------------------------------------- filter and sort
     def _match_visible(self, values: tuple) -> bool:
         wanted = self.status_filter.get()
-        if wanted != ALL_STATUS and values[3] != wanted:
+        if wanted != ALL_STATUS and values[4] != wanted:
             return False
         query = norm_text(self.search_match.get())
         if not query:
             return True
-        haystack = norm_text(" ".join(str(values[i]) for i in (1, 2, 5, 6)))
+        haystack = norm_text(" ".join(str(values[i]) for i in (1, 2, 3, 6, 7)))
         return query in haystack
 
     def _scan_visible(self, values: tuple) -> bool:
@@ -2593,7 +2825,10 @@ class App(tk.Tk):
         tree = self.match_tree
         tree.delete(*tree.get_children())
         shown = 0
-        for item_id, (values, tag) in sorted(self.match_rows.items(), key=lambda kv: kv[1][0][0]):
+        for item_id, (values, tag) in sorted(
+            self.match_rows.items(),
+            key=lambda kv: (self.sheet_order.get(kv[1][0][1], 0), kv[1][0][0]),
+        ):
             if self._match_visible(values):
                 tree.insert("", "end", iid=item_id, values=values, tags=(tag,) if tag else ())
                 shown += 1
