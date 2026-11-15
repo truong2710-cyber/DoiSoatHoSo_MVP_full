@@ -1,13 +1,16 @@
+
 name: Build Windows EXE
 
 on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -29,6 +32,7 @@ jobs:
         run: |
           $detector = "deepdoc_vietocr/onnx/det.onnx"
           $recognizer = "deepdoc_vietocr/vietocr/weight/vgg_seq2seq.pth"
+
           if (!(Test-Path $detector) -or !(Test-Path $recognizer)) {
             throw "Commit det.onnx and vgg_seq2seq.pth at the expected DeepDoc paths."
           }
@@ -47,6 +51,7 @@ jobs:
         shell: cmd
         run: build_windows.bat
 
+      # Keep the existing downloadable workflow artifact
       - name: Upload portable app folder
         uses: actions/upload-artifact@v4
         with:
@@ -54,3 +59,26 @@ jobs:
           path: dist/DoiSoatHoSo/
           if-no-files-found: error
           retention-days: 14
+
+      # Package the application only when building a version tag
+      - name: Package application for release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $zipName = "DoiSoatHoSo-$version-windows-x64.zip"
+
+          Compress-Archive `
+            -Path "dist/DoiSoatHoSo/*" `
+            -DestinationPath $zipName `
+            -CompressionLevel Optimal
+
+      # Automatically create GitHub Release and attach ZIP
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: DoiSoatHoSo ${{ github.ref_name }}
+          generate_release_notes: true
+          files: DoiSoatHoSo-${{ github.ref_name }}-windows-x64.zip
+          fail_on_unmatched_files: true
