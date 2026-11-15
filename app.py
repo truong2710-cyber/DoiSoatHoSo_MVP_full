@@ -63,8 +63,8 @@ OCR_DPI = 150            # trước đây 216. Nếu OCR sai nhiều thì thử 
 MAX_IMAGE_SIDE = 1800    # cạnh dài tối đa của ảnh đưa vào OCR (px)
 MAX_PAGES = 8            # số trang tối đa mỗi PDF
 MAX_WORKERS = 6          # trần cứng; số worker thực tế tự thích ứng theo RAM/CPU
-WORKER_RAM_GB = 1.5      # RAM ước tính mỗi tiến trình OCR
-MIN_FREE_RAM_GB = 1.0    # luôn chừa lại ngần này RAM trống cho Windows
+WORKER_RAM_GB = 0.9      # RAM mỗi tiến trình OCR: đo thực tế ~730 MB + dự phòng ~20%
+MIN_FREE_RAM_GB = 0.8    # luôn chừa lại ngần này RAM trống cho Windows
 CPU_TARGET_PERCENT = 85  # CPU dưới mức này thì mới tăng thêm worker
 USE_CACHE = True         # lưu kết quả quét để lần chạy sau không OCR lại
 CACHE_VERSION = "v3-fitz150-earlyexit"   # đổi chuỗi này khi sửa logic trích xuất
@@ -1380,8 +1380,13 @@ def choose_worker_plan(pending: int) -> tuple[int, int]:
     by_cpu = max(1, cores - 1)
     ram = available_ram_gb()
     by_ram = (
-        max(1, int((ram - MIN_FREE_RAM_GB) // WORKER_RAM_GB)) if ram is not None else 2
+        int((ram - MIN_FREE_RAM_GB) // WORKER_RAM_GB) if ram is not None else 2
     )
+    # Máy từ 4 nhân và còn >= 2.5 GB trống: luôn cho chạy ít nhất 2 tiến trình.
+    # Nếu RAM tụt xuống thấp, adapt_concurrency() sẽ tự giảm số PDF chạy đồng thời.
+    if cores >= 4 and (ram is None or ram >= 2.5):
+        by_ram = max(by_ram, 2)
+    by_ram = max(1, by_ram)
     workers = max(1, min(by_cpu, by_ram, MAX_WORKERS, pending))
     threads = max(1, round(cores / workers))
     return workers, threads
@@ -1406,6 +1411,7 @@ def scan_pdfs(pdfs: list[Path], pdf_dir: Path, progress, on_scan) -> list[Docume
     cache = _load_cache(pdf_dir)
     done = 0
     pending: list[int] = []
+    state = {"note": ""}   # ghi chú hiển thị cách đang quét (song song hay tuần tự)
 
     for index, path in enumerate(pdfs):
         hit = None
@@ -1438,7 +1444,7 @@ def scan_pdfs(pdfs: list[Path], pdf_dir: Path, progress, on_scan) -> list[Docume
                 cache[str(path.resolve())] = (size, mtime, info)
             except OSError:
                 pass
-        progress("scan", done, total, f"Đã đọc {path.name}")
+        progress("scan", done, total, f"Đã đọc {path.name}{state['note']}")
         if on_scan:
             on_scan(index + 1, total, path, "done", info)
         if done % CACHE_SAVE_EVERY == 0:
@@ -1453,7 +1459,7 @@ def scan_pdfs(pdfs: list[Path], pdf_dir: Path, progress, on_scan) -> list[Docume
         for index in indices:
             check_cancel()
             path = pdfs[index]
-            progress("scan", done, total, f"Đang đọc {path.name}")
+            progress("scan", done, total, f"Đang đọc {path.name}{state['note']}")
             if on_scan:
                 on_scan(index + 1, total, path, "start", None)
             try:
@@ -1464,6 +1470,11 @@ def scan_pdfs(pdfs: list[Path], pdf_dir: Path, progress, on_scan) -> list[Docume
 
     if pending:
         workers, threads = choose_worker_plan(len(pending))
+        ram_now = available_ram_gb()
+        ram_text = f"RAM trống {ram_now:.1f} GB" if ram_now is not None else "không đo được RAM"
+        if workers <= 1:
+            reason = "chỉ còn 1 file" if len(pending) == 1 else ram_text
+            state["note"] = f"   •   quét tuần tự, 1 tiến trình ({reason}, {os.cpu_count()} nhân)"
         if workers <= 1:
             global OCR_THREADS
             OCR_THREADS = os.cpu_count() or 2
@@ -1501,9 +1512,15 @@ def scan_pdfs(pdfs: list[Path], pdf_dir: Path, progress, on_scan) -> list[Docume
                                 info = _error_info(pdfs[index], exc)
                             finish(index, info)
                         limit = adapt_concurrency(limit, workers)
+                        ram_now = available_ram_gb()
+                        ram_text = f"RAM trống {ram_now:.1f} GB" if ram_now is not None else "không đo được RAM"
+                        state["note"] = (
+                            f"   •   song song {len(in_flight)}/{limit} (tối đa {workers}; {ram_text})"
+                        )
             except BrokenProcessPool:
                 # Hết RAM hoặc tiến trình con bị chết: quét nốt các file còn lại tuần tự.
                 remaining = [i for i in pending if docs[i] is None]
+                state["note"] = "   •   tiến trình con bị lỗi, chuyển sang quét tuần tự"
                 OCR_THREADS = os.cpu_count() or 2
                 scan_sequential(remaining)
 
