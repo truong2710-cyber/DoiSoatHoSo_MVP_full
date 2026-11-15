@@ -1,0 +1,127 @@
+
+name: Publish OCR Application Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: ocr-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find latest successful build
+        id: find_build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $response = gh api "repos/$env:GITHUB_REPOSITORY/actions/workflows/build.yml/runs?branch=main&status=success&per_page=100" | ConvertFrom-Json
+
+          $selectedRun = $null
+
+          foreach ($run in $response.workflow_runs) {
+            $artifacts = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$($run.id)/artifacts" | ConvertFrom-Json
+
+            $artifact = $artifacts.artifacts | Where-Object {
+              $_.name -eq "DoiSoatHoSo-windows-x64-onedir" -and
+              $_.expired -eq $false
+            } | Select-Object -First 1
+
+            if ($null -ne $artifact) {
+              $selectedRun = $run
+              break
+            }
+          }
+
+          if ($null -eq $selectedRun) {
+            throw "No successful, non-expired build artifact was found on main."
+          }
+
+          "run_id=$($selectedRun.id)" >> $env:GITHUB_OUTPUT
+          "source_sha=$($selectedRun.head_sha)" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Selected build: $($selectedRun.id)"
+          Write-Host "Source commit: $($selectedRun.head_sha)"
+
+      - name: Download existing build artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.find_build.outputs.run_id }}
+        run: |
+          gh run download $env:RUN_ID `
+            --name "DoiSoatHoSo-windows-x64-onedir" `
+            --dir "release_payload"
+
+          if (!(Test-Path "release_payload") -or
+              !(Get-ChildItem "release_payload" -Force)) {
+            throw "Downloaded artifact is empty."
+          }
+
+      - name: Generate next version
+        id: version
+        shell: pwsh
+        run: |
+          git fetch --force --tags origin
+
+          $versions = foreach ($tag in (git tag --list "v*")) {
+            if ($tag -match '^v(\d+)\.(\d+)\.(\d+)$') {
+              [version]$tag.Substring(1)
+            }
+          }
+
+          $latest = $versions |
+            Sort-Object -Descending |
+            Select-Object -First 1
+
+          if ($null -eq $latest) {
+            $nextVersion = "v1.0.0"
+          } else {
+            $nextVersion = "v$($latest.Major).$($latest.Minor).$($latest.Build + 1)"
+          }
+
+          "version=$nextVersion" >> $env:GITHUB_OUTPUT
+          Write-Host "Next version: $nextVersion"
+
+      - name: Create version tag
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SOURCE_SHA: ${{ steps.find_build.outputs.source_sha }}
+        run: |
+          git tag $env:VERSION $env:SOURCE_SHA
+          git push origin $env:VERSION
+
+      - name: Package application
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $zipName = "DoiSoatHoSo-$env:VERSION-windows-x64.zip"
+
+          Compress-Archive `
+            -Path "release_payload/*" `
+            -DestinationPath $zipName `
+            -CompressionLevel Optimal
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: DoiSoatHoSo ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: DoiSoatHoSo-${{ steps.version.outputs.version }}-windows-x64.zip
+          fail_on_unmatched_files: true
